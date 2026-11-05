@@ -17,7 +17,8 @@ entities:
       - ai_consumption.py
       - .streamlit/config.toml
       - config.json
-    idle_auto_shutdown_time_seconds: 86400
+      - logo.jpg
+    idle_auto_shutdown_time_seconds: 3600
     schedules:
       cron_exprs:
         - 0 8 * * 1,2,3,4,5

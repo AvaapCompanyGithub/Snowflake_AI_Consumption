@@ -94,29 +94,13 @@ def _load_config():
                 raise ValueError("config.json must contain a JSON object")
             return data, path
     raise FileNotFoundError(
-        "config.json not found next to cost_summary.py. "
-        "Add config.json with contract_start, annual_capacity, credit_rate, credit_rate_label."
+        "config.json not found next to ai_consumption.py. "
+        "Add config.json with default_date_range."
     )
 
+# Credits only: AI services are billed at the contracted AI credit rate, not the
+# compute rate, so no dollar conversion is applied here.
 _cfg, _cfg_path = _load_config()
-contract_start = datetime.strptime(str(_cfg["contract_start"])[:10], "%Y-%m-%d").date()
-annual_budget = float(_cfg["annual_capacity"])
-credit_price = float(_cfg["credit_rate"])
-rate_choice = str(_cfg.get("credit_rate_label", "") or "Configured rate")
-if credit_price <= 0:
-    rate_choice = "Credits only"
-
-# Rate / capacity note (matches selected credit rate)
-if credit_price <= 0 or rate_choice == "Credits only":
-    rate_note = "Dollar figures suppressed. All values reported in credits."
-else:
-    rate_note = (
-        f"${credit_price:,.2f} per credit - configured rate for {rate_choice}. "
-        "Actual rates vary by cloud and region, and contracted rates may differ. "
-        "Treat dollar figures as indicative. Capacity remaining is measured from the "
-        "current contract anniversary through today, independent of the date range above."
-    )
-
 date_range = str(_cfg.get("default_date_range", "TODAY")).upper()
 
 # ----------------------------------------------------------------------
@@ -142,13 +126,14 @@ CHART_BLUE = "#4C6EF5"
 CHART_GOLD = "#D4A017"
 
 service_colors = {
-    "AISQL Functions": "#f2b949",        # yellow
     "Cortex Agents": "#ff7f0e",          # orange
     "AI Functions": "#2ca02c",           # green
     "Cortex Analyst": "#d62728",         # red
     "Cortex Search": "#7f7f7f",          # gray
     "Cortex Code (Snowsight)": "#1f77b4",# blue
     "Cortex Code (CLI)": "#9467bd",      # purple
+    "Cortex Code (Desktop)": "#17becf",  # teal
+    "Snowflake CoWork": "#e377c2",       # pink
 }
 
 # ----------------------------------------------------------------------
@@ -409,13 +394,10 @@ p_end = (end_date + timedelta(days=1)).isoformat()
 # ----------------------------------------------------------------------
 
 #Query: Get Service/Credits
+# CORTEX_AISQL_USAGE_HISTORY is a subset of CORTEX_AI_FUNCTIONS_USAGE_HISTORY
+# (same QUERY_IDs), so only the AI Functions view is counted.
 summary_sql = f"""
-WITH aisql AS (
-    SELECT 'AISQL Functions' AS service, ROUND(SUM(TOKEN_CREDITS), 4) AS credits
-    FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_AISQL_USAGE_HISTORY
-    WHERE USAGE_TIME >= '{p_start}' AND USAGE_TIME < '{p_end}'
-),
-agent AS (
+WITH agent AS (
     SELECT 'Cortex Agents' AS service, ROUND(SUM(TOKEN_CREDITS), 4) AS credits
     FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_AGENT_USAGE_HISTORY
     WHERE START_TIME >= '{p_start}' AND START_TIME < '{p_end}'
@@ -444,10 +426,21 @@ code_cli AS (
     SELECT 'Cortex Code (CLI)' AS service, ROUND(SUM(TOKEN_CREDITS), 4) AS credits
     FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_CODE_CLI_USAGE_HISTORY
     WHERE USAGE_TIME >= '{p_start}' AND USAGE_TIME < '{p_end}'
+),
+code_desktop AS (
+    SELECT 'Cortex Code (Desktop)' AS service, ROUND(SUM(TOKEN_CREDITS), 4) AS credits
+    FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_CODE_DESKTOP_USAGE_HISTORY
+    WHERE USAGE_TIME >= '{p_start}' AND USAGE_TIME < '{p_end}'
+),
+cowork AS (
+    SELECT 'Snowflake CoWork' AS service, ROUND(SUM(TOKEN_CREDITS), 4) AS credits
+    FROM SNOWFLAKE.ACCOUNT_USAGE.SNOWFLAKE_COWORK_USAGE_HISTORY
+    WHERE START_TIME >= '{p_start}' AND START_TIME < '{p_end}'
 )
-SELECT * FROM aisql UNION ALL SELECT * FROM agent UNION ALL SELECT * FROM ai_func
+SELECT * FROM agent UNION ALL SELECT * FROM ai_func
 UNION ALL SELECT * FROM analyst UNION ALL SELECT * FROM search
 UNION ALL SELECT * FROM code_ss UNION ALL SELECT * FROM code_cli
+UNION ALL SELECT * FROM code_desktop UNION ALL SELECT * FROM cowork
 """
 
 #df_summary = run_query(summary_sql)
@@ -458,15 +451,15 @@ total_credits = df_summary["CREDITS"].sum()
 top_service = df_summary.loc[df_summary["CREDITS"].idxmax(), "SERVICE"] if total_credits > 0 else "N/A"
 active_services = (df_summary["CREDITS"] > 0).sum()
 
-#Compare to previous
-prev_days = (end_date - start_date).days
+#Compare to previous: same number of days, ending the day before start_date.
+# Both dates are inclusive, so a range covers (end - start) + 1 days.
+num_days = (end_date - start_date).days + 1
+prev_days = num_days
 if prev_days > 0:
     prev_start = (start_date - timedelta(days=prev_days)).strftime("%Y-%m-%d")
     prev_end = p_start
     prev_sql = f"""
-    WITH aisql AS (
-        SELECT ROUND(SUM(TOKEN_CREDITS), 4) AS credits FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_AISQL_USAGE_HISTORY WHERE USAGE_TIME >= '{prev_start}' AND USAGE_TIME < '{prev_end}'
-    ), agent AS (
+    WITH agent AS (
         SELECT ROUND(SUM(TOKEN_CREDITS), 4) AS credits FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_AGENT_USAGE_HISTORY WHERE START_TIME >= '{prev_start}' AND START_TIME < '{prev_end}'
     ), ai_func AS (
         SELECT ROUND(SUM(CREDITS), 4) AS credits FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_AI_FUNCTIONS_USAGE_HISTORY WHERE START_TIME >= '{prev_start}' AND START_TIME < '{prev_end}'
@@ -478,11 +471,16 @@ if prev_days > 0:
         SELECT ROUND(SUM(TOKEN_CREDITS), 4) AS credits FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_CODE_SNOWSIGHT_USAGE_HISTORY WHERE USAGE_TIME >= '{prev_start}' AND USAGE_TIME < '{prev_end}'
     ), code_cli AS (
         SELECT ROUND(SUM(TOKEN_CREDITS), 4) AS credits FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_CODE_CLI_USAGE_HISTORY WHERE USAGE_TIME >= '{prev_start}' AND USAGE_TIME < '{prev_end}'
+    ), code_desktop AS (
+        SELECT ROUND(SUM(TOKEN_CREDITS), 4) AS credits FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_CODE_DESKTOP_USAGE_HISTORY WHERE USAGE_TIME >= '{prev_start}' AND USAGE_TIME < '{prev_end}'
+    ), cowork AS (
+        SELECT ROUND(SUM(TOKEN_CREDITS), 4) AS credits FROM SNOWFLAKE.ACCOUNT_USAGE.SNOWFLAKE_COWORK_USAGE_HISTORY WHERE START_TIME >= '{prev_start}' AND START_TIME < '{prev_end}'
     )
     SELECT COALESCE(SUM(credits), 0) AS total FROM (
-        SELECT * FROM aisql UNION ALL SELECT * FROM agent UNION ALL SELECT * FROM ai_func
+        SELECT * FROM agent UNION ALL SELECT * FROM ai_func
         UNION ALL SELECT * FROM analyst UNION ALL SELECT * FROM search
         UNION ALL SELECT * FROM code_ss UNION ALL SELECT * FROM code_cli
+        UNION ALL SELECT * FROM code_desktop UNION ALL SELECT * FROM cowork
     )
     """
     #prev_credits = run_query(prev_sql)["TOTAL"].iloc[0]
@@ -497,15 +495,15 @@ if prev_days > 0:
 else:
     delta_str = "N/A"
 
-#Avg daily
-num_days = max((end_date - start_date).days, 1)
+#Avg daily (num_days is inclusive of both ends)
 avg_daily = total_credits / num_days
 
 #Count total requests
 total_code_requests_sql = f"""
 SELECT
     (SELECT COUNT(DISTINCT REQUEST_ID) FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_CODE_SNOWSIGHT_USAGE_HISTORY WHERE USAGE_TIME >= '{p_start}' AND USAGE_TIME < '{p_end}') +
-    (SELECT COUNT(DISTINCT REQUEST_ID) FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_CODE_CLI_USAGE_HISTORY WHERE USAGE_TIME >= '{p_start}' AND USAGE_TIME < '{p_end}') AS TOTAL_REQUESTS
+    (SELECT COUNT(DISTINCT REQUEST_ID) FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_CODE_CLI_USAGE_HISTORY WHERE USAGE_TIME >= '{p_start}' AND USAGE_TIME < '{p_end}') +
+    (SELECT COUNT(DISTINCT REQUEST_ID) FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_CODE_DESKTOP_USAGE_HISTORY WHERE USAGE_TIME >= '{p_start}' AND USAGE_TIME < '{p_end}') AS TOTAL_REQUESTS
 """
 #total_code_requests = run_query(total_code_requests_sql)["TOTAL_REQUESTS"].iloc[0]
 total_code_requests = run(total_code_requests_sql, p_start, p_end)["TOTAL_REQUESTS"].iloc[0]
@@ -636,6 +634,11 @@ with right:
 st.divider()
 st.subheader("Credit Summary Table")
 st.dataframe(df_summary.sort_values("CREDITS", ascending=False).reset_index(drop=True), use_container_width=True, hide_index=True)
+st.caption(
+    "AI Functions includes all AISQL function calls (AI_COMPLETE, AI_CLASSIFY, etc.). "
+    "Cortex Agents includes Cortex Analyst tool calls made by agents; those are not in Cortex Analyst. "
+    "Snowflake CoWork (formerly Snowflake Intelligence) excludes Cortex Agent requests, so the two do not overlap."
+)
 
 # ----------------------------------------------------------------------
 # Daily Credit Trend
@@ -647,17 +650,11 @@ st.subheader("Daily Credit Trend (All Services)")
 #Filter by Services, Warehouse, Database
 fil1, _ = st.columns(2)
 with fil1:
-    trend_view = st.selectbox("Filter Trend By", ["All Services", "By Warehouse (AISQL & AI Functions)", "By Database (Agents & Search)"])
-if trend_view == "By Warehouse (AISQL & AI Functions)":
+    trend_view = st.selectbox("Filter Trend By", ["All Services", "By Warehouse (AI Functions)", "By Database (Agents & Search)"])
+if trend_view == "By Warehouse (AI Functions)":
     trend_sql = f"""
     WITH wh_data AS (
-        SELECT DATE(a.USAGE_TIME) AS usage_date, q.WAREHOUSE_NAME AS dimension, SUM(a.TOKEN_CREDITS) AS credits
-        FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_AISQL_USAGE_HISTORY a
-        JOIN SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY q ON a.QUERY_ID = q.QUERY_ID
-        WHERE a.USAGE_TIME >= '{p_start}' AND a.USAGE_TIME < '{p_end}' AND q.WAREHOUSE_NAME IS NOT NULL
-        GROUP BY 1, 2
-        UNION ALL
-        SELECT DATE(h.START_TIME), q.WAREHOUSE_NAME, SUM(h.CREDITS)
+        SELECT DATE(h.START_TIME) AS usage_date, q.WAREHOUSE_NAME AS dimension, SUM(h.CREDITS) AS credits
         FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_AI_FUNCTIONS_USAGE_HISTORY h
         JOIN SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY q ON h.QUERY_ID = q.QUERY_ID
         WHERE h.START_TIME >= '{p_start}' AND h.START_TIME < '{p_end}' AND q.WAREHOUSE_NAME IS NOT NULL
@@ -687,11 +684,7 @@ elif trend_view == "By Database (Agents & Search)":
 else:
     trend_sql = f"""
     WITH daily_data AS (
-        SELECT DATE(USAGE_TIME) AS usage_date, 'AISQL Functions' AS service, SUM(TOKEN_CREDITS) AS credits
-        FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_AISQL_USAGE_HISTORY
-        WHERE USAGE_TIME >= '{p_start}' AND USAGE_TIME < '{p_end}' GROUP BY DATE(USAGE_TIME)
-        UNION ALL
-        SELECT DATE(START_TIME), 'Cortex Agents', SUM(TOKEN_CREDITS)
+        SELECT DATE(START_TIME) AS usage_date, 'Cortex Agents' AS service, SUM(TOKEN_CREDITS) AS credits
         FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_AGENT_USAGE_HISTORY
         WHERE START_TIME >= '{p_start}' AND START_TIME < '{p_end}' GROUP BY DATE(START_TIME)
         UNION ALL
@@ -714,6 +707,14 @@ else:
         SELECT DATE(USAGE_TIME), 'Cortex Code (CLI)', SUM(TOKEN_CREDITS)
         FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_CODE_CLI_USAGE_HISTORY
         WHERE USAGE_TIME >= '{p_start}' AND USAGE_TIME < '{p_end}' GROUP BY DATE(USAGE_TIME)
+        UNION ALL
+        SELECT DATE(USAGE_TIME), 'Cortex Code (Desktop)', SUM(TOKEN_CREDITS)
+        FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_CODE_DESKTOP_USAGE_HISTORY
+        WHERE USAGE_TIME >= '{p_start}' AND USAGE_TIME < '{p_end}' GROUP BY DATE(USAGE_TIME)
+        UNION ALL
+        SELECT DATE(START_TIME), 'Snowflake CoWork', SUM(TOKEN_CREDITS)
+        FROM SNOWFLAKE.ACCOUNT_USAGE.SNOWFLAKE_COWORK_USAGE_HISTORY
+        WHERE START_TIME >= '{p_start}' AND START_TIME < '{p_end}' GROUP BY DATE(START_TIME)
     )
     SELECT USAGE_DATE, SERVICE AS DIMENSION, ROUND(CREDITS, 4) AS CREDITS FROM daily_data ORDER BY USAGE_DATE
     """
@@ -736,68 +737,156 @@ else:
     st.info("No daily trend data in selected period.")
 
 # ----------------------------------------------------------------------
+# Per-user usage (shared by Cost Efficiency, Top Users, Cost-per-Request)
+# One row per usage record with a resolved user name, a request key and a
+# request count, so every section below sums the same credits as the headline.
+# ----------------------------------------------------------------------
+
+# Requests are not the same unit across services, so each service is labelled
+# and interactive services are never ranked against batch SQL queries.
+SERVICE_UNITS = {
+    "Cortex Agents": "agent request",
+    "Cortex Analyst": "Analyst request",
+    "Cortex Code (Snowsight)": "Code request",
+    "Cortex Code (CLI)": "Code request",
+    "Cortex Code (Desktop)": "Code request",
+    "Snowflake CoWork": "CoWork request",
+    "AI Functions": "SQL query",
+}
+INTERACTIVE_SERVICES = ["Cortex Agents", "Cortex Analyst", "Cortex Code (Snowsight)", "Cortex Code (CLI)",
+                        "Cortex Code (Desktop)", "Snowflake CoWork"]
+BATCH_SERVICES = ["AI Functions"]
+
+# USER_ID 0 is Snowflake's internal SYSTEM user (QUERY_HISTORY reports it as SYSTEM).
+# Cortex Analyst records the login name (often an email), so it is mapped via LOGIN_NAME.
+user_usage_cte = f"""
+WITH login_map AS (
+    SELECT UPPER(LOGIN_NAME) AS login_key, NAME
+    FROM SNOWFLAKE.ACCOUNT_USAGE.USERS
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY UPPER(LOGIN_NAME) ORDER BY DELETED_ON IS NULL DESC, CREATED_ON DESC) = 1
+),
+user_usage AS (
+    SELECT COALESCE(h.USER_NAME, u.NAME, IFF(h.USER_ID = 0, 'SYSTEM', 'USER_ID ' || h.USER_ID)) AS user_name,
+           'Cortex Agents' AS service, h.TOKEN_CREDITS AS credits, h.TOKENS AS tokens,
+           h.REQUEST_ID::VARCHAR AS request_key, 0 AS request_n
+    FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_AGENT_USAGE_HISTORY h
+    LEFT JOIN SNOWFLAKE.ACCOUNT_USAGE.USERS u ON h.USER_ID = u.USER_ID
+    WHERE h.START_TIME >= '{p_start}' AND h.START_TIME < '{p_end}'
+
+    UNION ALL
+    SELECT COALESCE(u.NAME, IFF(h.USER_ID = 0, 'SYSTEM', 'USER_ID ' || h.USER_ID)), 'AI Functions', h.CREDITS, NULL,
+           h.QUERY_ID::VARCHAR, 0
+    FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_AI_FUNCTIONS_USAGE_HISTORY h
+    LEFT JOIN SNOWFLAKE.ACCOUNT_USAGE.USERS u ON h.USER_ID = u.USER_ID
+    WHERE h.START_TIME >= '{p_start}' AND h.START_TIME < '{p_end}'
+
+    UNION ALL
+    SELECT COALESCE(m.NAME, a.USERNAME), 'Cortex Analyst', a.CREDITS, NULL, NULL, a.REQUEST_COUNT
+    FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_ANALYST_USAGE_HISTORY a
+    LEFT JOIN login_map m ON m.login_key = UPPER(a.USERNAME)
+    WHERE a.START_TIME >= '{p_start}' AND a.START_TIME < '{p_end}'
+
+    UNION ALL
+    SELECT 'Cortex Search (service)', 'Cortex Search', CREDITS, TOKENS, NULL, 0
+    FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_SEARCH_DAILY_USAGE_HISTORY
+    WHERE USAGE_DATE >= '{p_start}' AND USAGE_DATE < '{p_end}'
+
+    UNION ALL
+    SELECT COALESCE(u.NAME, IFF(h.USER_ID = 0, 'SYSTEM', 'USER_ID ' || h.USER_ID)), 'Cortex Code (Snowsight)', h.TOKEN_CREDITS, h.TOKENS,
+           h.REQUEST_ID::VARCHAR, 0
+    FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_CODE_SNOWSIGHT_USAGE_HISTORY h
+    LEFT JOIN SNOWFLAKE.ACCOUNT_USAGE.USERS u ON h.USER_ID = u.USER_ID
+    WHERE h.USAGE_TIME >= '{p_start}' AND h.USAGE_TIME < '{p_end}'
+
+    UNION ALL
+    SELECT COALESCE(u.NAME, IFF(h.USER_ID = 0, 'SYSTEM', 'USER_ID ' || h.USER_ID)), 'Cortex Code (CLI)', h.TOKEN_CREDITS, h.TOKENS,
+           h.REQUEST_ID::VARCHAR, 0
+    FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_CODE_CLI_USAGE_HISTORY h
+    LEFT JOIN SNOWFLAKE.ACCOUNT_USAGE.USERS u ON h.USER_ID = u.USER_ID
+    WHERE h.USAGE_TIME >= '{p_start}' AND h.USAGE_TIME < '{p_end}'
+
+    UNION ALL
+    SELECT COALESCE(h.USER_NAME, u.NAME, IFF(h.USER_ID = 0, 'SYSTEM', 'USER_ID ' || h.USER_ID)), 'Cortex Code (Desktop)', h.TOKEN_CREDITS, h.TOKENS,
+           h.REQUEST_ID::VARCHAR, 0
+    FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_CODE_DESKTOP_USAGE_HISTORY h
+    LEFT JOIN SNOWFLAKE.ACCOUNT_USAGE.USERS u ON h.USER_ID = u.USER_ID
+    WHERE h.USAGE_TIME >= '{p_start}' AND h.USAGE_TIME < '{p_end}'
+
+    UNION ALL
+    SELECT COALESCE(h.USER_NAME, u.NAME, IFF(h.USER_ID = 0, 'SYSTEM', 'USER_ID ' || h.USER_ID)), 'Snowflake CoWork', h.TOKEN_CREDITS, h.TOKENS,
+           h.REQUEST_ID::VARCHAR, 0
+    FROM SNOWFLAKE.ACCOUNT_USAGE.SNOWFLAKE_COWORK_USAGE_HISTORY h
+    LEFT JOIN SNOWFLAKE.ACCOUNT_USAGE.USERS u ON h.USER_ID = u.USER_ID
+    WHERE h.START_TIME >= '{p_start}' AND h.START_TIME < '{p_end}'
+)
+"""
+
+# Requests = distinct request keys + pre-aggregated Analyst request counts.
+REQUESTS_EXPR = "COUNT(DISTINCT request_key) + COALESCE(SUM(request_n), 0)"
+
+
+def add_cost_per_request(df: pd.DataFrame) -> pd.DataFrame:
+    df["TOTAL_CREDITS"] = df["TOTAL_CREDITS"].fillna(0)
+    df["TOTAL_REQUESTS"] = df["TOTAL_REQUESTS"].fillna(0).astype(int)
+    df = df[df["TOTAL_REQUESTS"] > 0].copy()
+    df["UNIT"] = df["SERVICE"].map(SERVICE_UNITS)
+    df["COST_PER_REQUEST"] = (df["TOTAL_CREDITS"] / df["TOTAL_REQUESTS"]).round(6)
+    return df.sort_values("COST_PER_REQUEST", ascending=False)
+
+
+def cpr_chart(df: pd.DataFrame, y_field: str, x_title: str, height: int, show_legend: bool = False):
+    # One legend per section: the scale domain lists every service, so the
+    # legend on one chart also covers its neighbour.
+    legend = alt.Legend(title="Service") if show_legend else None
+    return alt.Chart(df).mark_bar().encode(
+        x=alt.X("COST_PER_REQUEST:Q", title=x_title),
+        y=alt.Y(f"{y_field}:N", sort="-x", title=""),
+        color=alt.Color("SERVICE:N", legend=legend, scale=alt.Scale(domain=list(service_colors.keys()), range=list(service_colors.values()))),
+        tooltip=[c for c in ["USER_NAME", "SERVICE", "UNIT", "TOTAL_CREDITS", "TOTAL_REQUESTS", "COST_PER_REQUEST"] if c in df.columns],
+    ).properties(height=height)
+
+
+# ----------------------------------------------------------------------
 # Cost Efficiency
 # ----------------------------------------------------------------------
 
 st.divider()
 st.subheader("Cost Efficiency by Service")
 
-#Query
 efficiency_sql = f"""
-WITH aisql AS (
-    SELECT 'AISQL Functions' AS service, ROUND(SUM(TOKEN_CREDITS), 6) AS total_credits, COUNT(DISTINCT QUERY_ID) AS total_requests
-    FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_AISQL_USAGE_HISTORY
-    WHERE USAGE_TIME >= '{p_start}' AND USAGE_TIME < '{p_end}'
-),
-agent AS (
-    SELECT 'Cortex Agents', ROUND(SUM(TOKEN_CREDITS), 6), COUNT(DISTINCT REQUEST_ID)
-    FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_AGENT_USAGE_HISTORY
-    WHERE START_TIME >= '{p_start}' AND START_TIME < '{p_end}'
-),
-ai_func AS (
-    SELECT 'AI Functions', ROUND(SUM(CREDITS), 6), COUNT(DISTINCT QUERY_ID)
-    FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_AI_FUNCTIONS_USAGE_HISTORY
-    WHERE START_TIME >= '{p_start}' AND START_TIME < '{p_end}'
-),
-analyst AS (
-    SELECT 'Cortex Analyst', ROUND(SUM(CREDITS), 6), SUM(REQUEST_COUNT)
-    FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_ANALYST_USAGE_HISTORY
-    WHERE START_TIME >= '{p_start}' AND START_TIME < '{p_end}'
-),
-code_ss AS (
-    SELECT 'Cortex Code (Snowsight)', ROUND(SUM(TOKEN_CREDITS), 6), COUNT(DISTINCT REQUEST_ID)
-    FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_CODE_SNOWSIGHT_USAGE_HISTORY
-    WHERE USAGE_TIME >= '{p_start}' AND USAGE_TIME < '{p_end}'
-),
-code_cli AS (
-    SELECT 'Cortex Code (CLI)', ROUND(SUM(TOKEN_CREDITS), 6), COUNT(DISTINCT REQUEST_ID)
-    FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_CODE_CLI_USAGE_HISTORY
-    WHERE USAGE_TIME >= '{p_start}' AND USAGE_TIME < '{p_end}'
-)
-SELECT * FROM aisql UNION ALL SELECT * FROM agent UNION ALL SELECT * FROM ai_func
-UNION ALL SELECT * FROM analyst UNION ALL SELECT * FROM code_ss UNION ALL SELECT * FROM code_cli
+{user_usage_cte}
+SELECT service AS SERVICE, ROUND(SUM(credits), 6) AS TOTAL_CREDITS, {REQUESTS_EXPR} AS TOTAL_REQUESTS
+FROM user_usage
+WHERE service <> 'Cortex Search'
+GROUP BY 1
 """
 
 df_eff = run(efficiency_sql, p_start, p_end)
-#Clean the dataframe
-df_eff.columns = ["SERVICE", "TOTAL_CREDITS", "TOTAL_REQUESTS"]
-df_eff["TOTAL_CREDITS"] = df_eff["TOTAL_CREDITS"].fillna(0)
-df_eff["TOTAL_REQUESTS"] = df_eff["TOTAL_REQUESTS"].fillna(0).astype(int)
-df_eff = df_eff[df_eff["TOTAL_REQUESTS"] > 0]
-df_eff["COST_PER_REQUEST"] = (df_eff["TOTAL_CREDITS"] / df_eff["TOTAL_REQUESTS"]).round(6)
-df_eff = df_eff.sort_values("COST_PER_REQUEST", ascending=False)
-
-#Bar chart
 if not df_eff.empty:
-    eff_chart = alt.Chart(df_eff).mark_bar().encode(
-        x=alt.X("COST_PER_REQUEST:Q", title="Credits per Request"),
-        y=alt.Y("SERVICE:N", sort="-x", title=""),
-        #color=alt.Color("SERVICE:N", legend=None),
-        color=alt.Color("SERVICE:N", title="Service", scale=alt.Scale(domain=list(service_colors.keys()), range=list(service_colors.values()))),
-        tooltip=["SERVICE", "TOTAL_CREDITS", "TOTAL_REQUESTS", "COST_PER_REQUEST"]
-    ).properties(height=250)
-    st.altair_chart(eff_chart, use_container_width=True)
-    st.dataframe(df_eff.reset_index(drop=True), use_container_width=True, hide_index=True)
+    df_eff = add_cost_per_request(df_eff)
+
+if not df_eff.empty:
+    eff_cols = ["SERVICE", "UNIT", "TOTAL_CREDITS", "TOTAL_REQUESTS", "COST_PER_REQUEST"]
+    e1, e2 = st.columns([2, 1])
+    with e1:
+        st.markdown('<div class="panel-title">Interactive services: credits per request</div>', unsafe_allow_html=True)
+        df_int = df_eff[df_eff["SERVICE"].isin(INTERACTIVE_SERVICES)]
+        if not df_int.empty:
+            st.altair_chart(cpr_chart(df_int, "SERVICE", "Credits per Request", 220, show_legend=True), use_container_width=True)
+        else:
+            st.info("No interactive requests in selected period.")
+    with e2:
+        st.markdown('<div class="panel-title">AI Functions: credits per SQL query</div>', unsafe_allow_html=True)
+        df_batch = df_eff[df_eff["SERVICE"].isin(BATCH_SERVICES)]
+        if not df_batch.empty:
+            st.altair_chart(cpr_chart(df_batch, "SERVICE", "Credits per SQL Query", 220), use_container_width=True)
+        else:
+            st.info("No AI Function queries in selected period.")
+    st.dataframe(df_eff[eff_cols].reset_index(drop=True), use_container_width=True, hide_index=True)
+    st.caption(
+        "Units differ by service. An AI Functions query can process many rows, so its cost per query "
+        "is not comparable to a single agent or Code request. Cortex Search has no request count and is excluded."
+    )
 else:
     st.info("No request data in selected period.")
 
@@ -808,100 +897,42 @@ else:
 st.divider()
 st.subheader("Top Users by AI Credits")
 
-#Tabs showing top users by Service type
-#tab1, tab2, tab3, tab4, tab5 = st.tabs(["AISQL Functions", "Cortex Agents", "AI Functions", "Cortex Code (Snowsight)", "Cortex Code (CLI)"])
+TAB_SERVICES = ["Cortex Agents", "Snowflake CoWork", "AI Functions", "Cortex Analyst",
+                "Cortex Code (Snowsight)", "Cortex Code (CLI)", "Cortex Code (Desktop)"]
+tabs = st.tabs(["Total AI Use"] + TAB_SERVICES)
 
-tab_total, tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "Total AI Use",
-    "AISQL Functions",
-    "Cortex Agents",
-    "AI Functions",
-    "Cortex Code (Snowsight)",
-    "Cortex Code (CLI)",
-])
-
-with tab_total:
+with tabs[0]:
     st.dataframe(run(f"""
-    WITH usage AS (
-        SELECT u.NAME AS USER_NAME,
-               h.TOKEN_CREDITS AS CREDITS,
-               h.TOKENS AS TOKENS,
-               h.QUERY_ID AS REQUEST_ID
-        FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_AISQL_USAGE_HISTORY h
-        LEFT JOIN SNOWFLAKE.ACCOUNT_USAGE.USERS u
-          ON TRY_CAST(h.USER_ID AS NUMBER) = u.USER_ID
-        WHERE h.USAGE_TIME >= '{p_start}' AND h.USAGE_TIME < '{p_end}'
-
-        UNION ALL
-        SELECT USER_NAME, TOKEN_CREDITS, TOKENS, REQUEST_ID
-        FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_AGENT_USAGE_HISTORY
-        WHERE START_TIME >= '{p_start}' AND START_TIME < '{p_end}'
-
-        UNION ALL
-        SELECT u.NAME, h.CREDITS, NULL, h.QUERY_ID
-        FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_AI_FUNCTIONS_USAGE_HISTORY h
-        LEFT JOIN SNOWFLAKE.ACCOUNT_USAGE.USERS u
-          ON h.USER_ID = u.USER_ID
-        WHERE h.START_TIME >= '{p_start}' AND h.START_TIME < '{p_end}'
-
-        UNION ALL
-        SELECT u.NAME, h.TOKEN_CREDITS, h.TOKENS, h.REQUEST_ID
-        FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_CODE_SNOWSIGHT_USAGE_HISTORY h
-        LEFT JOIN SNOWFLAKE.ACCOUNT_USAGE.USERS u
-          ON h.USER_ID = u.USER_ID
-        WHERE h.USAGE_TIME >= '{p_start}' AND h.USAGE_TIME < '{p_end}'
-
-        UNION ALL
-        SELECT u.NAME, h.TOKEN_CREDITS, h.TOKENS, h.REQUEST_ID
-        FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_CODE_CLI_USAGE_HISTORY h
-        LEFT JOIN SNOWFLAKE.ACCOUNT_USAGE.USERS u
-          ON h.USER_ID = u.USER_ID
-        WHERE h.USAGE_TIME >= '{p_start}' AND h.USAGE_TIME < '{p_end}'
-    )
-    SELECT COALESCE(USER_NAME, 'Unknown') AS USER_NAME,
-           ROUND(SUM(CREDITS), 4) AS TOTAL_CREDITS,
-           SUM(TOKENS) AS TOTAL_TOKENS,
-           COUNT(DISTINCT REQUEST_ID) AS REQUESTS
-    FROM usage
+    {user_usage_cte}
+    SELECT user_name AS USER_NAME,
+           ROUND(SUM(credits), 4) AS TOTAL_CREDITS,
+           SUM(tokens) AS TOTAL_TOKENS,
+           {REQUESTS_EXPR} AS REQUESTS
+    FROM user_usage
     GROUP BY 1
     ORDER BY TOTAL_CREDITS DESC
-    LIMIT 25
     """, p_start, p_end), use_container_width=True, hide_index=True)
+    st.caption(
+        "Includes every service, so the column total matches Total AI Credits. "
+        "Cortex Search is billed per service, not per user. SYSTEM is Snowflake's internal user (USER_ID 0). "
+        "Requests mix units across services; see Cost Efficiency for per-service units. "
+        "AI Functions does not report tokens."
+    )
 
-with tab1:
-    st.dataframe(run(f"""
-    SELECT u.NAME AS USER_NAME, ROUND(SUM(h.TOKEN_CREDITS), 4) AS TOTAL_CREDITS, SUM(h.TOKENS) AS TOTAL_TOKENS, COUNT(DISTINCT h.QUERY_ID) AS QUERIES
-    FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_AISQL_USAGE_HISTORY h LEFT JOIN SNOWFLAKE.ACCOUNT_USAGE.USERS u ON TRY_CAST(h.USER_ID AS NUMBER) = u.USER_ID
-    WHERE h.USAGE_TIME >= '{p_start}' AND h.USAGE_TIME < '{p_end}' GROUP BY u.NAME ORDER BY TOTAL_CREDITS DESC LIMIT 25
-    """, p_start, p_end), use_container_width=True, hide_index=True)
-
-with tab2:
-    st.dataframe(run(f"""
-    SELECT USER_NAME, ROUND(SUM(TOKEN_CREDITS), 4) AS TOTAL_CREDITS, SUM(TOKENS) AS TOTAL_TOKENS, COUNT(DISTINCT REQUEST_ID) AS REQUESTS
-    FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_AGENT_USAGE_HISTORY
-    WHERE START_TIME >= '{p_start}' AND START_TIME < '{p_end}' GROUP BY USER_NAME ORDER BY TOTAL_CREDITS DESC LIMIT 25
-    """, p_start, p_end), use_container_width=True, hide_index=True)
-
-with tab3:
-    st.dataframe(run(f"""
-    SELECT u.NAME AS USER_NAME, ROUND(SUM(h.CREDITS), 4) AS TOTAL_CREDITS, COUNT(DISTINCT h.QUERY_ID) AS QUERIES
-    FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_AI_FUNCTIONS_USAGE_HISTORY h LEFT JOIN SNOWFLAKE.ACCOUNT_USAGE.USERS u ON h.USER_ID = u.USER_ID
-    WHERE h.START_TIME >= '{p_start}' AND h.START_TIME < '{p_end}' GROUP BY u.NAME ORDER BY TOTAL_CREDITS DESC LIMIT 25
-    """, p_start, p_end), use_container_width=True, hide_index=True)
-
-with tab4:
-    st.dataframe(run(f"""
-    SELECT u.NAME AS USER_NAME, ROUND(SUM(h.TOKEN_CREDITS), 4) AS TOTAL_CREDITS, SUM(h.TOKENS) AS TOTAL_TOKENS, COUNT(DISTINCT h.REQUEST_ID) AS REQUESTS
-    FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_CODE_SNOWSIGHT_USAGE_HISTORY h LEFT JOIN SNOWFLAKE.ACCOUNT_USAGE.USERS u ON h.USER_ID = u.USER_ID
-    WHERE h.USAGE_TIME >= '{p_start}' AND h.USAGE_TIME < '{p_end}' GROUP BY u.NAME ORDER BY TOTAL_CREDITS DESC LIMIT 25
-    """, p_start, p_end), use_container_width=True, hide_index=True)
-
-with tab5:
-    st.dataframe(run(f"""
-    SELECT u.NAME AS USER_NAME, ROUND(SUM(h.TOKEN_CREDITS), 4) AS TOTAL_CREDITS, SUM(h.TOKENS) AS TOTAL_TOKENS, COUNT(DISTINCT h.REQUEST_ID) AS REQUESTS
-    FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_CODE_CLI_USAGE_HISTORY h LEFT JOIN SNOWFLAKE.ACCOUNT_USAGE.USERS u ON h.USER_ID = u.USER_ID
-    WHERE h.USAGE_TIME >= '{p_start}' AND h.USAGE_TIME < '{p_end}' GROUP BY u.NAME ORDER BY TOTAL_CREDITS DESC LIMIT 25
-    """, p_start, p_end), use_container_width=True, hide_index=True)
+for tab, svc in zip(tabs[1:], TAB_SERVICES):
+    with tab:
+        st.dataframe(run(f"""
+        {user_usage_cte}
+        SELECT user_name AS USER_NAME,
+               ROUND(SUM(credits), 4) AS TOTAL_CREDITS,
+               SUM(tokens) AS TOTAL_TOKENS,
+               {REQUESTS_EXPR} AS REQUESTS
+        FROM user_usage
+        WHERE service = '{svc}'
+        GROUP BY 1
+        ORDER BY TOTAL_CREDITS DESC
+        """, p_start, p_end), use_container_width=True, hide_index=True)
+        st.caption(f"Requests counted per {SERVICE_UNITS[svc]}.")
 
 # ----------------------------------------------------------------------
 # Users by Highest Service/Cost
@@ -910,67 +941,38 @@ with tab5:
 st.divider()
 st.subheader("Highest Cost-per-Request by User")
 
-#Query
 user_eff_sql = f"""
-WITH aisql AS (
-    SELECT u.NAME AS user_name, 'AISQL Functions' AS service, ROUND(SUM(h.TOKEN_CREDITS), 6) AS total_credits, COUNT(DISTINCT h.QUERY_ID) AS total_requests
-    FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_AISQL_USAGE_HISTORY h
-    LEFT JOIN SNOWFLAKE.ACCOUNT_USAGE.USERS u ON TRY_CAST(h.USER_ID AS NUMBER) = u.USER_ID
-    WHERE h.USAGE_TIME >= '{p_start}' AND h.USAGE_TIME < '{p_end}'
-    GROUP BY u.NAME
-),
-agent AS (
-    SELECT USER_NAME, 'Cortex Agents', ROUND(SUM(TOKEN_CREDITS), 6), COUNT(DISTINCT REQUEST_ID)
-    FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_AGENT_USAGE_HISTORY
-    WHERE START_TIME >= '{p_start}' AND START_TIME < '{p_end}'
-    GROUP BY USER_NAME
-),
-ai_func AS (
-    SELECT u.NAME, 'AI Functions', ROUND(SUM(h.CREDITS), 6), COUNT(DISTINCT h.QUERY_ID)
-    FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_AI_FUNCTIONS_USAGE_HISTORY h
-    LEFT JOIN SNOWFLAKE.ACCOUNT_USAGE.USERS u ON h.USER_ID = u.USER_ID
-    WHERE h.START_TIME >= '{p_start}' AND h.START_TIME < '{p_end}'
-    GROUP BY u.NAME
-),
-code_ss AS (
-    SELECT u.NAME, 'Cortex Code (Snowsight)', ROUND(SUM(h.TOKEN_CREDITS), 6), COUNT(DISTINCT h.REQUEST_ID)
-    FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_CODE_SNOWSIGHT_USAGE_HISTORY h
-    LEFT JOIN SNOWFLAKE.ACCOUNT_USAGE.USERS u ON h.USER_ID = u.USER_ID
-    WHERE h.USAGE_TIME >= '{p_start}' AND h.USAGE_TIME < '{p_end}'
-    GROUP BY u.NAME
-),
-code_cli AS (
-    SELECT u.NAME, 'Cortex Code (CLI)', ROUND(SUM(h.TOKEN_CREDITS), 6), COUNT(DISTINCT h.REQUEST_ID)
-    FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_CODE_CLI_USAGE_HISTORY h
-    LEFT JOIN SNOWFLAKE.ACCOUNT_USAGE.USERS u ON h.USER_ID = u.USER_ID
-    WHERE h.USAGE_TIME >= '{p_start}' AND h.USAGE_TIME < '{p_end}'
-    GROUP BY u.NAME
-)
-SELECT * FROM aisql UNION ALL SELECT * FROM agent UNION ALL SELECT * FROM ai_func
-UNION ALL SELECT * FROM code_ss UNION ALL SELECT * FROM code_cli
+{user_usage_cte}
+SELECT user_name AS USER_NAME, service AS SERVICE, ROUND(SUM(credits), 6) AS TOTAL_CREDITS, {REQUESTS_EXPR} AS TOTAL_REQUESTS
+FROM user_usage
+WHERE service <> 'Cortex Search'
+GROUP BY 1, 2
 """
 
 df_user_eff = run(user_eff_sql, p_start, p_end)
-#Clean the dataframe
-df_user_eff.columns = ["USER_NAME", "SERVICE", "TOTAL_CREDITS", "TOTAL_REQUESTS"]
-df_user_eff["TOTAL_CREDITS"] = df_user_eff["TOTAL_CREDITS"].fillna(0)
-df_user_eff["TOTAL_REQUESTS"] = df_user_eff["TOTAL_REQUESTS"].fillna(0).astype(int)
-df_user_eff = df_user_eff[df_user_eff["TOTAL_REQUESTS"] > 0]
-df_user_eff["COST_PER_REQUEST"] = (df_user_eff["TOTAL_CREDITS"] / df_user_eff["TOTAL_REQUESTS"]).round(6)
-df_user_eff = df_user_eff.sort_values("COST_PER_REQUEST", ascending=False).head(20)
+if not df_user_eff.empty:
+    df_user_eff = add_cost_per_request(df_user_eff)
 
-#Bar chart and table
 if not df_user_eff.empty:
     df_user_eff["LABEL"] = df_user_eff["USER_NAME"].fillna("Unknown") + " (" + df_user_eff["SERVICE"] + ")"
-    user_chart = alt.Chart(df_user_eff).mark_bar().encode(
-        x=alt.X("COST_PER_REQUEST:Q", title="Credits per Request"),
-        y=alt.Y("LABEL:N", sort="-x", title=""),
-        #color=alt.Color("SERVICE:N", title="Service"),
-        color=alt.Color("SERVICE:N", title="Service", scale=alt.Scale(domain=list(service_colors.keys()), range=list(service_colors.values()))),
-        tooltip=["USER_NAME", "SERVICE", "TOTAL_CREDITS", "TOTAL_REQUESTS", "COST_PER_REQUEST"]
-    ).properties(height=400)
-    st.altair_chart(user_chart, use_container_width=True)
-    st.dataframe(df_user_eff[["USER_NAME", "SERVICE", "TOTAL_CREDITS", "TOTAL_REQUESTS", "COST_PER_REQUEST"]].reset_index(drop=True), use_container_width=True, hide_index=True)
+    user_cols = ["USER_NAME", "SERVICE", "UNIT", "TOTAL_CREDITS", "TOTAL_REQUESTS", "COST_PER_REQUEST"]
+    u1, u2 = st.columns(2)
+    with u1:
+        st.markdown('<div class="panel-title">Interactive services: credits per request (top 15)</div>', unsafe_allow_html=True)
+        df_u_int = df_user_eff[df_user_eff["SERVICE"].isin(INTERACTIVE_SERVICES)].head(15)
+        if not df_u_int.empty:
+            st.altair_chart(cpr_chart(df_u_int, "LABEL", "Credits per Request", 400, show_legend=True), use_container_width=True)
+            st.dataframe(df_u_int[user_cols].reset_index(drop=True), use_container_width=True, hide_index=True)
+        else:
+            st.info("No interactive requests in selected period.")
+    with u2:
+        st.markdown('<div class="panel-title">AI Functions: credits per SQL query (top 15)</div>', unsafe_allow_html=True)
+        df_u_batch = df_user_eff[df_user_eff["SERVICE"].isin(BATCH_SERVICES)].head(15)
+        if not df_u_batch.empty:
+            st.altair_chart(cpr_chart(df_u_batch, "LABEL", "Credits per SQL Query", 400), use_container_width=True)
+            st.dataframe(df_u_batch[user_cols].reset_index(drop=True), use_container_width=True, hide_index=True)
+        else:
+            st.info("No AI Function queries in selected period.")
 else:
     st.info("No user request data in selected period.")
 
@@ -988,7 +990,10 @@ st.markdown(
     understate actual consumption, and the most recent day is always partial.<br><br>
     Figures are drawn from ACCOUNT_USAGE and are for internal analysis only -
     they will not tie exactly to your Snowflake invoice. Use ORGANIZATION_USAGE
-    or the billing statement for figures of record.
+    or the billing statement for figures of record.<br><br>
+    All values are in credits. AI services are billed at your contracted AI credit
+    rate (see the Snowflake Service Consumption Table), which differs from the compute
+    rate, so no dollar conversion is shown. Date ranges include both the start and end day.
     </div>
     """,
     unsafe_allow_html=True,
