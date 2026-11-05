@@ -6,7 +6,8 @@ Uses only packages bundled with Streamlit in Snowflake — no extra packages nee
 """
 
 import decimal
-import math
+import html
+import re
 from typing import Optional
 
 import streamlit as st
@@ -24,13 +25,7 @@ from snowflake.snowpark.context import get_active_session
 try:
     session = get_active_session()
 except Exception:
-    conn = st.connection("snowflake")
-    session = conn.session()
-else:
-    class _SessConn:
-        def query(self, sql, ttl=300):
-            return session.sql(sql).to_pandas()
-    conn = _SessConn()
+    session = st.connection("snowflake").session()
 
 # -------------------------------------------------
 # Page config
@@ -68,13 +63,6 @@ def run(sql: str, start: str, end: str) -> pd.DataFrame:
         st.warning(f"Query failed, section will be empty: {e}")
         return pd.DataFrame()
 
-def run_optional(sql: str, start: str, end: str) -> pd.DataFrame:
-    """Silent variant: these views are legitimately absent on many accounts."""
-    try:
-        return _query(sql, start, end)
-    except Exception:
-        return pd.DataFrame()
-
 # ------------------------------------------------------------------
 # Config from config.json (same folder as this app)
 # ------------------------------------------------------------------
@@ -102,6 +90,18 @@ def _load_config():
 # compute rate, so no dollar conversion is applied here.
 _cfg, _cfg_path = _load_config()
 date_range = str(_cfg.get("default_date_range", "TODAY")).upper()
+
+# Optional quota to report against. Validated as a plain DB.SCHEMA.NAME
+# identifier because it is interpolated into CALL statements.
+quota_fqn = str(_cfg.get("quota_fqn", "UTIL_DB.COSTS.AI_QUOTA")).strip()
+if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_$]*(\.[A-Za-z_][A-Za-z0-9_$]*){2}", quota_fqn):
+    quota_fqn = ""
+
+# Optional direct link to the quota's Snowsight page (copy it from the browser).
+# Only https URLs are accepted because the value is rendered as an HTML link.
+quota_url = str(_cfg.get("quota_url", "") or "").strip()
+if not re.fullmatch(r"https://[^\s\"'<>]+", quota_url):
+    quota_url = ""
 
 # ----------------------------------------------------------------------
 # Colors
@@ -337,7 +337,8 @@ with title_col:
         f'<div class="masthead">{_logo_html}<h1>AI Consumption Dashboard</h1></div>'
         '<div class="subhead">Overview of usage on the account.</div>'
         f'<div style="color:{MUTED};font-size:.72rem;margin:-0.35rem 0 0.15rem 0;">'
-        f"Last refreshed: {st.session_state.last_refreshed.strftime('%Y-%m-%d %H:%M:%S')}</div>",
+        f"Page opened: {st.session_state.last_refreshed.strftime('%Y-%m-%d %H:%M:%S')} · "
+        "usage data is cached for up to 1 hour, quota status for 15 minutes</div>",
         unsafe_allow_html=True,
     )
 
@@ -935,6 +936,237 @@ for tab, svc in zip(tabs[1:], TAB_SERVICES):
         st.caption(f"Requests counted per {SERVICE_UNITS[svc]}.")
 
 # ----------------------------------------------------------------------
+# AI Quota Status
+# Read from the quota's own API so the figures match what it enforces.
+# Quota cycles are UTC and independent of the date range selected above.
+# Hidden entirely when quota_fqn is invalid or the quota does not exist.
+# ----------------------------------------------------------------------
+
+
+@st.cache_data(ttl=900, show_spinner="Reading quota...")
+def _sql_cached(sql: str) -> pd.DataFrame:
+    # Build from collected rows: to_pandas() does not pick up the result
+    # schema of CALL / SHOW statements and fails with a column-count mismatch.
+    rows = session.sql(sql).collect()
+    df = pd.DataFrame([r.as_dict() for r in rows])
+    for c in df.columns:
+        if df[c].map(lambda v: isinstance(v, decimal.Decimal)).any():
+            df[c] = df[c].astype(float)
+    df.columns = [str(c).strip().strip('"').upper() for c in df.columns]
+    return df
+
+
+def _limit(cfg: pd.DataFrame, col: str) -> Optional[float]:
+    if col not in cfg.columns or pd.isna(cfg[col].iloc[0]):
+        return None
+    return float(cfg[col].iloc[0])
+
+
+def quota_status_section(fqn: str) -> None:
+    now_utc = pd.Timestamp.now(tz="UTC")
+    day_start = now_utc.normalize()
+    week_start = day_start - pd.Timedelta(days=day_start.dayofweek)  # ISO week, Monday
+    month_start = day_start.replace(day=1)
+    fetch_start = min(week_start, month_start)  # a week can start in the previous month
+
+    cfg = _sql_cached(f"CALL {fqn}!GET_CONFIG()")
+    scope = json.loads(_sql_cached(f"CALL {fqn}!GET_QUOTA_SCOPE()").iloc[0, 0])
+    spend = _sql_cached(
+        f"CALL {fqn}!GET_SPENDING_DETAILS_BY_USERS("
+        f"'{fetch_start:%Y-%m-%d}'::DATE, '{day_start:%Y-%m-%d}'::DATE)"
+    )
+    blocks = _sql_cached(f"CALL {fqn}!GET_ACTIVE_BLOCKS_V2()")
+
+    limits = {
+        "MONTH": _limit(cfg, "PER_USER_LIMIT"),
+        "WEEK": _limit(cfg, "PER_USER_LIMIT_WEEKLY"),
+        "DAY": _limit(cfg, "PER_USER_LIMIT_DAILY"),
+    }
+    enforcement = bool(cfg["BLOCK_ENFORCEMENT_ENABLED"].iloc[0]) if "BLOCK_ENFORCEMENT_ENABLED" in cfg.columns else False
+    domains = [r.get("domain", "") for r in scope.get("shared_resources", [])]
+    excluded = [u.get("user_name", "") for u in scope.get("excluded_users", [])]
+
+    def fmt_limit(v):
+        return "not set" if v is None else f"{v:,.0f}"
+
+    # Link straight to the quota's page under Admin » Cost management » Budgets.
+    # quota_url in config.json overrides the URL built from quota_fqn.
+    docs_link = '<a href="https://docs.snowflake.com/en/user-guide/budgets/per-user-quotas" target="_blank">docs</a>'
+    if quota_url:
+        target = quota_url
+    else:
+        acct = _sql_cached("SELECT LOWER(CURRENT_ORGANIZATION_NAME()) AS ORG, LOWER(CURRENT_ACCOUNT_NAME()) AS ACCT")
+        db, schema, name = fqn.split(".")
+        target = (
+            f"https://app.snowflake.com/{acct['ORG'].iloc[0]}/{acct['ACCT'].iloc[0]}"
+            f"/#/account/usage/quota/{db.upper()}/{schema.upper()}/{name.upper()}"
+        )
+    link_html = f'<a href="{html.escape(target, quote=True)}" target="_blank">Open quota {html.escape(fqn)}</a> · {docs_link}'
+
+    st.markdown(
+        f'<div class="note" style="margin-top:0">'
+        f"{link_html}<br>"
+        f"<b>{fqn}</b> · per-user limits: month {fmt_limit(limits['MONTH'])}, "
+        f"week {fmt_limit(limits['WEEK'])}, day {fmt_limit(limits['DAY'])} credits · "
+        f"block enforcement {'ON' if enforcement else 'OFF'} · "
+        f"counts: {', '.join(domains) or 'nothing (no shared resources)'} · "
+        f"not limited: {', '.join(excluded) or 'none'}<br>"
+        f"Cycles are UTC: month from {month_start:%Y-%m-%d}, week from {week_start:%Y-%m-%d}, "
+        f"day {day_start:%Y-%m-%d}. The date range at the top of the page does not apply here."
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+    if not spend.empty:
+        spend["TS"] = pd.to_datetime(spend["USAGE_TIMESTAMP"], utc=True)
+        spend["CREDITS_SPEND"] = spend["CREDITS_SPEND"].astype(float)
+        in_month = spend[spend["TS"] >= month_start]
+        per_user = pd.DataFrame({
+            "MONTH": in_month.groupby("USER_NAME")["CREDITS_SPEND"].sum(),
+            "WEEK": spend[spend["TS"] >= week_start].groupby("USER_NAME")["CREDITS_SPEND"].sum(),
+            "DAY": spend[spend["TS"] >= day_start].groupby("USER_NAME")["CREDITS_SPEND"].sum(),
+        }).fillna(0.0)
+        by_domain = in_month.groupby(["USER_NAME", "ENTITY_TYPE"])["CREDITS_SPEND"].sum().reset_index()
+        by_domain["TXT"] = by_domain["ENTITY_TYPE"] + " " + by_domain["CREDITS_SPEND"].map("{:,.2f}".format)
+        per_user["MONTH_BY_DOMAIN"] = by_domain.groupby("USER_NAME")["TXT"].agg(", ".join)
+    else:
+        per_user = pd.DataFrame(columns=["MONTH", "WEEK", "DAY", "MONTH_BY_DOMAIN"])
+
+    # Blocked users appear even if their spend falls outside the fetched window.
+    block_text = {}
+    if not blocks.empty:
+        for _, b in blocks.iterrows():
+            until = pd.to_datetime(b["BLOCKED_UNTIL"], utc=True)
+            block_text.setdefault(b["USER_NAME"], []).append(f"{b['CYCLE'].title()} until {until:%Y-%m-%d %H:%M} UTC")
+        for u in block_text:
+            if u not in per_user.index:
+                per_user.loc[u] = [0.0, 0.0, 0.0, ""]
+
+    if per_user.empty:
+        st.info("No quota-counted spend in the current cycles.")
+    else:
+        for cyc, lim in limits.items():
+            per_user[f"{cyc}_PCT"] = (per_user[cyc] / lim * 100).round(1) if lim else None
+
+        def status(row):
+            if row.name in block_text:
+                return "Blocked: " + "; ".join(block_text[row.name])
+            pcts = [row[f"{c}_PCT"] for c in limits if limits[c]]
+            worst = max(pcts) if pcts else 0
+            if worst >= 100:
+                return "Over limit"
+            if worst >= 80:
+                return "Warning (80%+)"
+            return "OK"
+
+        per_user["STATUS"] = per_user.apply(status, axis=1)
+        table = (
+            per_user.reset_index().rename(columns={"index": "USER_NAME"})
+            .sort_values(["MONTH_PCT", "MONTH"] if limits["MONTH"] else ["MONTH"], ascending=False)
+        )
+        for cyc in limits:
+            table[cyc] = table[cyc].round(4)
+        # Top 10 by % of monthly limit; blocked users are always kept so a block is never hidden.
+        total_users = len(table)
+        top_n = 10
+        table = table.reset_index(drop=True)
+        table = table[(table.index < top_n) | table["STATUS"].str.startswith("Blocked")]
+        cols = ["USER_NAME", "STATUS", "MONTH", "MONTH_PCT", "WEEK", "WEEK_PCT", "DAY", "DAY_PCT", "MONTH_BY_DOMAIN"]
+        table = table[cols].reset_index(drop=True)
+
+        # Readable headers; % columns show the limit they are measured against.
+        def pct_label(cyc, title):
+            lim = limits[cyc]
+            return f"{title} % of {lim:,.0f}" if lim else f"{title} % (no limit)"
+
+        headers = {
+            "USER_NAME": "User", "STATUS": "Status",
+            "MONTH": "Month credits", "MONTH_PCT": pct_label("MONTH", "Month"),
+            "WEEK": "Week credits", "WEEK_PCT": pct_label("WEEK", "Week"),
+            "DAY": "Today credits", "DAY_PCT": pct_label("DAY", "Today"),
+            "MONTH_BY_DOMAIN": "Month by domain",
+        }
+        table = table.rename(columns=headers)
+        pct_cols = [headers[f"{c}_PCT"] for c in limits]
+        credit_cols = [headers[c] for c in limits]
+
+        def highlight(row):
+            s = row["Status"]
+            if s.startswith("Blocked") or s == "Over limit":
+                return ["background-color: #FDE8E8"] * len(row)
+            if s.startswith("Warning"):
+                return ["background-color: #FFF4D6"] * len(row)
+            return [""] * len(row)
+
+        styled = (
+            table.style.apply(highlight, axis=1)
+            .format("{:.1f}%", subset=pct_cols, na_rep="—")
+            .format("{:,.4f}", subset=credit_cols)
+        )
+        st.dataframe(styled, use_container_width=True, hide_index=True)
+        if total_users > len(table):
+            st.caption(f"Showing the top {top_n} of {total_users} users by % of the monthly limit (plus any blocked users).")
+
+    # Reconcile with the rest of the app: AI credits this UTC month that the quota does not count.
+    ms = f"{month_start:%Y-%m-%d %H:%M:%S} +00:00"
+    mtd = _sql_cached(f"""
+        SELECT
+            (SELECT COALESCE(SUM(CREDITS), 0) FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_SEARCH_DAILY_USAGE_HISTORY
+              WHERE USAGE_DATE >= '{month_start:%Y-%m-%d}') AS SEARCH_CREDITS,
+            (SELECT COALESCE(SUM(CREDITS), 0) FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_ANALYST_USAGE_HISTORY
+              WHERE START_TIME >= '{ms}'::TIMESTAMP_TZ) AS ANALYST_CREDITS
+    """)
+    quota_total = float(per_user["MONTH"].sum()) if not per_user.empty else 0.0
+    st.caption(
+        f"Quota-counted spend this UTC month: {quota_total:,.2f} credits. Not counted by the quota: "
+        f"Cortex Search {float(mtd['SEARCH_CREDITS'].iloc[0]):,.2f}, Cortex Analyst API "
+        f"{float(mtd['ANALYST_CREDITS'].iloc[0]):,.2f}, and all spend by users who are not limited "
+        f"({', '.join(excluded) or 'none'}). Figures refresh every 15 minutes; quota evaluation itself lags spend."
+    )
+
+
+def quota_state(fqn: str) -> tuple:
+    """Return ("ok" | "absent" | "error", detail).
+
+    Reading the quota is the existence test. The section is hidden ("absent") only when
+    SHOW succeeds and confirms there is no quota by that name; any other failure is
+    reported, never hidden. Not cached, so a one-off empty result can't stick.
+    """
+    db, schema, name = fqn.split(".")
+    try:
+        session.sql(f"CALL {fqn}!GET_CONFIG()").collect()
+        return "ok", None
+    except Exception as call_err:
+        try:
+            rows = session.sql(f"SHOW SNOWFLAKE.CORE.QUOTA INSTANCES LIKE '{name}' IN SCHEMA {db}.{schema}").collect()
+        except Exception as show_err:
+            # Missing database or schema: the quota does not exist either.
+            if "does not exist" in str(show_err).lower():
+                return "absent", None
+            return "error", f"GET_CONFIG failed: {call_err} | SHOW failed: {show_err}"
+        # LIKE treats "_" as a wildcard, so confirm the exact name.
+        if not any(str(r.as_dict().get("name", "")).upper() == name.upper() for r in rows):
+            return "absent", None
+        return "error", f"The quota exists but could not be read: {call_err}"
+
+
+_quota_state, _quota_detail = quota_state(quota_fqn) if quota_fqn else ("absent", None)
+
+if _quota_state != "absent":
+    st.divider()
+    st.subheader("AI Quota Status")
+    if _quota_state == "error":
+        st.warning(
+            f"Could not read quota {quota_fqn}. The app runs as its owner role, which needs VIEWER on the quota "
+            f"(GRANT SNOWFLAKE.CORE.QUOTA ROLE {quota_fqn}!VIEWER TO ROLE <owner role>). Details: {_quota_detail}"
+        )
+    else:
+        try:
+            quota_status_section(quota_fqn)
+        except Exception as e:
+            st.warning(f"Could not display quota {quota_fqn}. Details: {e}")
+
+# ----------------------------------------------------------------------
 # Users by Highest Service/Cost
 # ----------------------------------------------------------------------
 
@@ -983,11 +1215,11 @@ else:
 st.divider()
 
 st.markdown(
-    f"""
+    """
     <div class="note">
-    ACCOUNT_USAGE views are not real time. Cortex usage lags
-    by about 5 minutes. Ranges that include today or yesterday will therefore
-    understate actual consumption, and the most recent day is always partial.<br><br>
+    ACCOUNT_USAGE views are not real time. Cortex usage views can lag by up to
+    about 3 hours (Cortex Code up to about 1 hour), so ranges that include today or
+    yesterday may be incomplete, and the most recent day is always partial.<br><br>
     Figures are drawn from ACCOUNT_USAGE and are for internal analysis only -
     they will not tie exactly to your Snowflake invoice. Use ORGANIZATION_USAGE
     or the billing statement for figures of record.<br><br>
