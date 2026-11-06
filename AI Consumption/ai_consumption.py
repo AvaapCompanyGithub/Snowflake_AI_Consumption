@@ -93,8 +93,9 @@ date_range = str(_cfg.get("default_date_range", "TODAY")).upper()
 
 # Optional quota to report against. Validated as a plain DB.SCHEMA.NAME
 # identifier because it is interpolated into CALL statements.
+_FQN_RE = r"[A-Za-z_][A-Za-z0-9_$]*(\.[A-Za-z_][A-Za-z0-9_$]*){2}"
 quota_fqn = str(_cfg.get("quota_fqn", "UTIL_DB.COSTS.AI_QUOTA")).strip()
-if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_$]*(\.[A-Za-z_][A-Za-z0-9_$]*){2}", quota_fqn):
+if not re.fullmatch(_FQN_RE, quota_fqn):
     quota_fqn = ""
 
 # Optional direct link to the quota's Snowsight page (copy it from the browser).
@@ -102,6 +103,34 @@ if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_$]*(\.[A-Za-z_][A-Za-z0-9_$]*){2}", qu
 quota_url = str(_cfg.get("quota_url", "") or "").strip()
 if not re.fullmatch(r"https://[^\s\"'<>]+", quota_url):
     quota_url = ""
+
+# Users allowed to change quota settings from the Admin tab. The app runs with
+# its owner's rights, so this list is the only thing stopping other viewers.
+_admins_cfg = _cfg.get("quota_admins") or []
+if isinstance(_admins_cfg, str):
+    _admins_cfg = [_admins_cfg]
+quota_admins = {
+    u.strip().upper()
+    for u in _admins_cfg
+    if isinstance(u, str) and u.strip()
+}
+# Audit table for Admin-tab changes; changes are refused if it is missing.
+quota_change_log = str(_cfg.get("quota_change_log", "UTIL_DB.COSTS.AI_QUOTA_CHANGE_LOG")).strip()
+if not re.fullmatch(_FQN_RE, quota_change_log):
+    quota_change_log = ""
+
+
+def viewer_name() -> str:
+    """The viewer's Snowflake username (st.user), or "" if unavailable."""
+    try:
+        return str(st.user.user_name or "").strip().upper()
+    except Exception:
+        return ""
+
+
+def is_quota_admin() -> bool:
+    name = viewer_name()
+    return bool(name) and name in quota_admins
 
 # ----------------------------------------------------------------------
 # Colors
@@ -225,7 +254,7 @@ st.markdown(
       }}
 
       .note {{
-        text-align: left; color: {MUTED}; font-size: .66rem;
+        text-align: left; color: {MUTED}; font-size: .75rem;
         margin: .55rem 0 1rem 0; line-height: 1.4;
       }}
       div[data-testid="stSelectbox"] label,
@@ -253,6 +282,13 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
+
+def info_text(text: str) -> None:
+    """Informational text in the page's subhead style ("Overview of usage on the account.").
+    Text is escaped because it can contain user names and object names."""
+    st.markdown(f'<div class="subhead">{html.escape(text)}</div>', unsafe_allow_html=True)
+
 
 # ----------------------------------------------------------------------
 # Logo
@@ -336,7 +372,7 @@ with title_col:
     st.markdown(
         f'<div class="masthead">{_logo_html}<h1>AI Consumption Dashboard</h1></div>'
         '<div class="subhead">Overview of usage on the account.</div>'
-        f'<div style="color:{MUTED};font-size:.72rem;margin:-0.35rem 0 0.15rem 0;">'
+        f'<div style="color:{MUTED};font-size:.75rem;margin:-0.35rem 0 0.15rem 0;">'
         f"Page opened: {st.session_state.last_refreshed.strftime('%Y-%m-%d %H:%M:%S')} · "
         "usage data is cached for up to 1 hour, quota status for 15 minutes</div>",
         unsafe_allow_html=True,
@@ -378,7 +414,7 @@ else:
 
 with range_col:
     st.markdown(
-        f'<div style="color:{MUTED};font-size:0.72rem;margin-top:-0.35rem;">'
+        f'<div style="color:{MUTED};font-size:.75rem;margin-top:-0.35rem;">'
         f'{start_date.strftime("%Y-%m-%d")} → {end_date.strftime("%Y-%m-%d")}'
         f'</div>',
         unsafe_allow_html=True,
@@ -540,7 +576,7 @@ def card_html(label: str, value: str, delta_html: str = "", foot_lines=None, pri
     )
 
 st.markdown(
-    f'<div style="color:{MUTED};font-size:0.72rem;margin:-1rem 0 0 0;padding:0 0 0.65rem 0;">'
+    f'<div style="color:{MUTED};font-size:.75rem;margin:-1rem 0 0 0;padding:0 0 0.65rem 0;">'
     f'Change vs prior period ({preset}).'
     f'</div>',
     unsafe_allow_html=True,
@@ -592,150 +628,259 @@ for col, c in zip(k, cards):
             unsafe_allow_html=True,
         )
 
-st.divider()
-
 # ----------------------------------------------------------------------
-# Credits by Service Pie Chart (left) and Service Distribution (right)
+# Tabs
+# Quota and Admin tabs appear only when the quota exists; Admin only for
+# users listed in quota_admins (see the Admin section below).
 # ----------------------------------------------------------------------
 
-left, right = st.columns(2)
-with left:
-    st.subheader("Credits by Service")
-    df_bar = df_summary[df_summary["CREDITS"] > 0].sort_values("CREDITS", ascending=False)
-    if not df_bar.empty:
-        chart = alt.Chart(df_bar).mark_bar().encode(
-            x=alt.X("CREDITS:Q", title="Credits"),
-            y=alt.Y("SERVICE:N", sort="-x", title=""),
-            #color=alt.Color("SERVICE:N", legend=None),
-            color=alt.Color("SERVICE:N", legend=None, scale=alt.Scale(domain=list(service_colors.keys()), range=list(service_colors.values()))),
-            tooltip=["SERVICE", "CREDITS"]
-        ).properties(height=300)
-        st.altair_chart(chart, use_container_width=True)
+def quota_state(fqn: str) -> tuple:
+    """Return ("ok" | "absent" | "error", detail).
+
+    Reading the quota is the existence test. The section is hidden ("absent") only when
+    SHOW succeeds and confirms there is no quota by that name; any other failure is
+    reported, never hidden. Not cached, so a one-off empty result can't stick.
+    """
+    db, schema, name = fqn.split(".")
+    try:
+        session.sql(f"CALL {fqn}!GET_CONFIG()").collect()
+        return "ok", None
+    except Exception as call_err:
+        try:
+            rows = session.sql(f"SHOW SNOWFLAKE.CORE.QUOTA INSTANCES LIKE '{name}' IN SCHEMA {db}.{schema}").collect()
+        except Exception as show_err:
+            # Missing database or schema: the quota does not exist either.
+            if "does not exist" in str(show_err).lower():
+                return "absent", None
+            return "error", f"GET_CONFIG failed: {call_err} | SHOW failed: {show_err}"
+        # LIKE treats "_" as a wildcard, so confirm the exact name.
+        if not any(str(r.as_dict().get("name", "")).upper() == name.upper() for r in rows):
+            return "absent", None
+        return "error", f"The quota exists but could not be read: {call_err}"
+
+
+_quota_state, _quota_detail = quota_state(quota_fqn) if quota_fqn else ("absent", None)
+
+_show_quota_tab = _quota_state != "absent"
+_show_admin_tab = _show_quota_tab and is_quota_admin()
+_tab_names = ["Overview", "Users", "Efficiency"]
+if _show_quota_tab:
+    _tab_names.append("Quota")
+if _show_admin_tab:
+    _tab_names.append("Admin")
+st.divider()  # separates the KPI cards from the tabs
+_main_tabs = dict(zip(_tab_names, st.tabs(_tab_names)))
+# Each tab shows a loading message until its section has finished, so tabs further
+# down the script don't look empty while the page is still running.
+_loading = {name: tab.empty() for name, tab in _main_tabs.items()}
+for _ph in _loading.values():
+    _ph.info("Loading data for this tab…")
+
+
+with _main_tabs["Overview"]:
+    # ----------------------------------------------------------------------
+    # Credits by Service Pie Chart (left) and Service Distribution (right)
+    # ----------------------------------------------------------------------
+
+    left, right = st.columns(2)
+    with left:
+        st.subheader("Credits by Service")
+        df_bar = df_summary[df_summary["CREDITS"] > 0].sort_values("CREDITS", ascending=False)
+        if not df_bar.empty:
+            chart = alt.Chart(df_bar).mark_bar().encode(
+                x=alt.X("CREDITS:Q", title="Credits"),
+                y=alt.Y("SERVICE:N", sort="-x", title=""),
+                #color=alt.Color("SERVICE:N", legend=None),
+                color=alt.Color("SERVICE:N", legend=None, scale=alt.Scale(domain=list(service_colors.keys()), range=list(service_colors.values()))),
+                tooltip=["SERVICE", "CREDITS"]
+            ).properties(height=300)
+            st.altair_chart(chart, use_container_width=True)
+        else:
+            st.info("No AI credit usage in selected period.")
+    with right:
+        st.subheader("Service Distribution")
+        df_pie = df_summary[df_summary["CREDITS"] > 0]
+        if not df_pie.empty:
+            pie = alt.Chart(df_pie).mark_arc(innerRadius=50).encode(
+                theta=alt.Theta("CREDITS:Q"),
+                #color=alt.Color("SERVICE:N", title="Service"),
+                color=alt.Color("SERVICE:N", title="Service", scale=alt.Scale(domain=list(service_colors.keys()), range=list(service_colors.values()))),
+                tooltip=["SERVICE", "CREDITS"]
+            ).properties(height=300)
+            st.altair_chart(pie, use_container_width=True)
+        else:
+            st.info("No data.")
+
+    # ----------------------------------------------------------------------
+    # Credit Summay
+    # ----------------------------------------------------------------------
+
+    #Credit Summary
+    st.divider()
+    st.subheader("Credit Summary Table")
+    st.dataframe(df_summary.sort_values("CREDITS", ascending=False).reset_index(drop=True), use_container_width=True, hide_index=True)
+    info_text(
+        "AI Functions includes all AISQL function calls (AI_COMPLETE, AI_CLASSIFY, etc.). "
+        "Cortex Agents includes Cortex Analyst tool calls made by agents; those are not in Cortex Analyst. "
+        "Snowflake CoWork (formerly Snowflake Intelligence) excludes Cortex Agent requests, so the two do not overlap."
+    )
+
+    # ----------------------------------------------------------------------
+    # Check against metered credits (what Snowflake bills from)
+    # Account-level daily totals by SERVICE_TYPE; used only as a cross-check, because
+    # service types get renamed (e.g. CORTEX_CODE_CLI -> SNOWFLAKE_COCO_CLI) and
+    # AI_SERVICES groups several services. Service types the app does not read are flagged.
+    # ----------------------------------------------------------------------
+
+    st.markdown('<div class="panel-title">Check against metered credits</div>', unsafe_allow_html=True)
+    df_meter = run(f"""
+        SELECT SERVICE_TYPE, ROUND(SUM(CREDITS_USED), 4) AS CREDITS
+        FROM SNOWFLAKE.ACCOUNT_USAGE.METERING_DAILY_HISTORY
+        WHERE USAGE_DATE >= '{p_start}' AND USAGE_DATE < '{p_end}'
+          AND SERVICE_TYPE RLIKE '^(CORTEX_|AI_|SNOWFLAKE_COCO|SNOWFLAKE_COWORK|SNOWFLAKE_INTELLIGENCE).*'
+        GROUP BY 1
+        HAVING SUM(CREDITS_USED) <> 0
+        ORDER BY 2 DESC
+    """, p_start, p_end)
+    # Service types whose usage the app already reads through its per-service views.
+    COVERED_TYPES = {
+        "AI_SERVICES", "AI_FUNCTIONS", "CORTEX_AGENTS", "CORTEX_SEARCH",
+        "CORTEX_CODE_CLI", "CORTEX_CODE_SNOWSIGHT", "CORTEX_CODE_DESKTOP",
+        "SNOWFLAKE_COCO", "SNOWFLAKE_COCO_CLI", "SNOWFLAKE_COCO_SNOWSIGHT", "SNOWFLAKE_COCO_DESKTOP",
+        "SNOWFLAKE_INTELLIGENCE", "SNOWFLAKE_COWORK",
+    }
+    if df_meter.empty:
+        st.info("No metered AI credits in the selected period.")
     else:
-        st.info("No AI credit usage in selected period.")
-with right:
-    st.subheader("Service Distribution")
-    df_pie = df_summary[df_summary["CREDITS"] > 0]
-    if not df_pie.empty:
-        pie = alt.Chart(df_pie).mark_arc(innerRadius=50).encode(
-            theta=alt.Theta("CREDITS:Q"),
-            #color=alt.Color("SERVICE:N", title="Service"),
-            color=alt.Color("SERVICE:N", title="Service", scale=alt.Scale(domain=list(service_colors.keys()), range=list(service_colors.values()))),
-            tooltip=["SERVICE", "CREDITS"]
-        ).properties(height=300)
-        st.altair_chart(pie, use_container_width=True)
+        df_meter["CREDITS"] = df_meter["CREDITS"].astype(float)
+        df_meter["IN_APP"] = df_meter["SERVICE_TYPE"].isin(COVERED_TYPES).map({True: "Yes", False: "No"})
+        metered_total = float(df_meter["CREDITS"].sum())
+        metered_covered = float(df_meter.loc[df_meter["IN_APP"] == "Yes", "CREDITS"].sum())
+        diff = metered_covered - total_credits
+        meter_cards = [
+            card_html("App total (usage views)", f"{total_credits:,.4f}",
+                      foot_lines=["Total AI Credits above"], primary=True),
+            card_html("Metered, services the app covers", f"{metered_covered:,.4f}",
+                      foot_lines=[f"{diff:+,.2f} vs app total"]),
+            card_html("Metered, all AI service types", f"{metered_total:,.4f}",
+                      foot_lines=[f"{metered_total - metered_covered:,.2f} not shown in the app"]),
+        ]
+        for col, card in zip(st.columns(3), meter_cards):
+            with col:
+                st.markdown(card, unsafe_allow_html=True)
+        st.markdown('<div style="height:1rem"></div>', unsafe_allow_html=True)  # space below the cards
+        missing = df_meter[df_meter["IN_APP"] == "No"]
+        if not missing.empty:
+            st.warning(
+                "Metered AI service types the app does not show: "
+                + ", ".join(f"{r.SERVICE_TYPE} ({r.CREDITS:,.2f})" for r in missing.itertuples())
+                + ". A new or renamed service type may need adding to the app."
+            )
+        with st.expander("Metered credits by service type"):
+            st.dataframe(df_meter.reset_index(drop=True), use_container_width=True, hide_index=True)
+        info_text(
+            "Source: SNOWFLAKE.ACCOUNT_USAGE.METERING_DAILY_HISTORY, CREDITS_USED (UTC days, before billing adjustments). "
+            "Small differences from the app total are expected: metering and the usage views refresh "
+            "at different times, and metering days are UTC while the date filter uses your session time zone."
+        )
+
+    # ----------------------------------------------------------------------
+    # Daily Credit Trend
+    # ----------------------------------------------------------------------
+
+    st.divider()
+    st.subheader("Daily Credit Trend (All Services)")
+
+    #Filter by Services, Warehouse, Database
+    fil1, _ = st.columns(2)
+    with fil1:
+        trend_view = st.selectbox("Filter Trend By", ["All Services", "By Warehouse (AI Functions)", "By Database (Agents & Search)"])
+    if trend_view == "By Warehouse (AI Functions)":
+        trend_sql = f"""
+        WITH wh_data AS (
+            SELECT DATE(h.START_TIME) AS usage_date, q.WAREHOUSE_NAME AS dimension, SUM(h.CREDITS) AS credits
+            FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_AI_FUNCTIONS_USAGE_HISTORY h
+            JOIN SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY q ON h.QUERY_ID = q.QUERY_ID
+            WHERE h.START_TIME >= '{p_start}' AND h.START_TIME < '{p_end}' AND q.WAREHOUSE_NAME IS NOT NULL
+            GROUP BY 1, 2
+        )
+        SELECT USAGE_DATE, DIMENSION, ROUND(SUM(CREDITS), 4) AS CREDITS FROM wh_data GROUP BY 1, 2 ORDER BY 1
+        """
+        color_field = "DIMENSION"
+        chart_title = "Daily Credits by Warehouse"
+    elif trend_view == "By Database (Agents & Search)":
+        trend_sql = f"""
+        WITH db_data AS (
+            SELECT DATE(START_TIME) AS usage_date, AGENT_DATABASE_NAME AS dimension, SUM(TOKEN_CREDITS) AS credits
+            FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_AGENT_USAGE_HISTORY
+            WHERE START_TIME >= '{p_start}' AND START_TIME < '{p_end}' AND AGENT_DATABASE_NAME IS NOT NULL
+            GROUP BY 1, 2
+            UNION ALL
+            SELECT DATE(USAGE_DATE), DATABASE_NAME, SUM(CREDITS)
+            FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_SEARCH_DAILY_USAGE_HISTORY
+            WHERE USAGE_DATE >= '{p_start}' AND USAGE_DATE < '{p_end}' AND DATABASE_NAME IS NOT NULL
+            GROUP BY 1, 2
+        )
+        SELECT USAGE_DATE, DIMENSION, ROUND(SUM(CREDITS), 4) AS CREDITS FROM db_data GROUP BY 1, 2 ORDER BY 1
+        """
+        color_field = "DIMENSION"
+        chart_title = "Daily Credits by Database"
     else:
-        st.info("No data.")
+        trend_sql = f"""
+        WITH daily_data AS (
+            SELECT DATE(START_TIME) AS usage_date, 'Cortex Agents' AS service, SUM(TOKEN_CREDITS) AS credits
+            FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_AGENT_USAGE_HISTORY
+            WHERE START_TIME >= '{p_start}' AND START_TIME < '{p_end}' GROUP BY DATE(START_TIME)
+            UNION ALL
+            SELECT DATE(START_TIME), 'AI Functions', SUM(CREDITS)
+            FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_AI_FUNCTIONS_USAGE_HISTORY
+            WHERE START_TIME >= '{p_start}' AND START_TIME < '{p_end}' GROUP BY DATE(START_TIME)
+            UNION ALL
+            SELECT DATE(START_TIME), 'Cortex Analyst', SUM(CREDITS)
+            FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_ANALYST_USAGE_HISTORY
+            WHERE START_TIME >= '{p_start}' AND START_TIME < '{p_end}' GROUP BY DATE(START_TIME)
+            UNION ALL
+            SELECT DATE(USAGE_DATE), 'Cortex Search', SUM(CREDITS)
+            FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_SEARCH_DAILY_USAGE_HISTORY
+            WHERE USAGE_DATE >= '{p_start}' AND USAGE_DATE < '{p_end}' GROUP BY DATE(USAGE_DATE)
+            UNION ALL
+            SELECT DATE(USAGE_TIME), 'Cortex Code (Snowsight)', SUM(TOKEN_CREDITS)
+            FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_CODE_SNOWSIGHT_USAGE_HISTORY
+            WHERE USAGE_TIME >= '{p_start}' AND USAGE_TIME < '{p_end}' GROUP BY DATE(USAGE_TIME)
+            UNION ALL
+            SELECT DATE(USAGE_TIME), 'Cortex Code (CLI)', SUM(TOKEN_CREDITS)
+            FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_CODE_CLI_USAGE_HISTORY
+            WHERE USAGE_TIME >= '{p_start}' AND USAGE_TIME < '{p_end}' GROUP BY DATE(USAGE_TIME)
+            UNION ALL
+            SELECT DATE(USAGE_TIME), 'Cortex Code (Desktop)', SUM(TOKEN_CREDITS)
+            FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_CODE_DESKTOP_USAGE_HISTORY
+            WHERE USAGE_TIME >= '{p_start}' AND USAGE_TIME < '{p_end}' GROUP BY DATE(USAGE_TIME)
+            UNION ALL
+            SELECT DATE(START_TIME), 'Snowflake CoWork', SUM(TOKEN_CREDITS)
+            FROM SNOWFLAKE.ACCOUNT_USAGE.SNOWFLAKE_COWORK_USAGE_HISTORY
+            WHERE START_TIME >= '{p_start}' AND START_TIME < '{p_end}' GROUP BY DATE(START_TIME)
+        )
+        SELECT USAGE_DATE, SERVICE AS DIMENSION, ROUND(CREDITS, 4) AS CREDITS FROM daily_data ORDER BY USAGE_DATE
+        """
+        color_field = "DIMENSION"
+        chart_title = "Daily Credits by Service"
 
-# ----------------------------------------------------------------------
-# Credit Summay
-# ----------------------------------------------------------------------
+    df_trend = run(trend_sql, p_start, p_end)
 
-#Credit Summary
-st.divider()
-st.subheader("Credit Summary Table")
-st.dataframe(df_summary.sort_values("CREDITS", ascending=False).reset_index(drop=True), use_container_width=True, hide_index=True)
-st.caption(
-    "AI Functions includes all AISQL function calls (AI_COMPLETE, AI_CLASSIFY, etc.). "
-    "Cortex Agents includes Cortex Analyst tool calls made by agents; those are not in Cortex Analyst. "
-    "Snowflake CoWork (formerly Snowflake Intelligence) excludes Cortex Agent requests, so the two do not overlap."
-)
+    #Line chart with series    
+    if not df_trend.empty:
+        stacked = alt.Chart(df_trend).mark_area(opacity=0.7).encode(
+            x=alt.X("USAGE_DATE:T", title="Date"),
+            y=alt.Y("CREDITS:Q", stack="zero", title="Credits"),
+            #color=alt.Color(f"{color_field}:N", title=chart_title.split("by ")[-1]),
+            color=alt.Color(f"{color_field}:N", title=chart_title.split("by ")[-1], scale=alt.Scale(domain=list(service_colors.keys()), range=list(service_colors.values()))),
+            tooltip=["USAGE_DATE:T", f"{color_field}:N", "CREDITS:Q"]
+        ).properties(height=350)
+        st.altair_chart(stacked, use_container_width=True)
+    else:
+        st.info("No daily trend data in selected period.")
 
-# ----------------------------------------------------------------------
-# Daily Credit Trend
-# ----------------------------------------------------------------------
-
-st.divider()
-st.subheader("Daily Credit Trend (All Services)")
-
-#Filter by Services, Warehouse, Database
-fil1, _ = st.columns(2)
-with fil1:
-    trend_view = st.selectbox("Filter Trend By", ["All Services", "By Warehouse (AI Functions)", "By Database (Agents & Search)"])
-if trend_view == "By Warehouse (AI Functions)":
-    trend_sql = f"""
-    WITH wh_data AS (
-        SELECT DATE(h.START_TIME) AS usage_date, q.WAREHOUSE_NAME AS dimension, SUM(h.CREDITS) AS credits
-        FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_AI_FUNCTIONS_USAGE_HISTORY h
-        JOIN SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY q ON h.QUERY_ID = q.QUERY_ID
-        WHERE h.START_TIME >= '{p_start}' AND h.START_TIME < '{p_end}' AND q.WAREHOUSE_NAME IS NOT NULL
-        GROUP BY 1, 2
-    )
-    SELECT USAGE_DATE, DIMENSION, ROUND(SUM(CREDITS), 4) AS CREDITS FROM wh_data GROUP BY 1, 2 ORDER BY 1
-    """
-    color_field = "DIMENSION"
-    chart_title = "Daily Credits by Warehouse"
-elif trend_view == "By Database (Agents & Search)":
-    trend_sql = f"""
-    WITH db_data AS (
-        SELECT DATE(START_TIME) AS usage_date, AGENT_DATABASE_NAME AS dimension, SUM(TOKEN_CREDITS) AS credits
-        FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_AGENT_USAGE_HISTORY
-        WHERE START_TIME >= '{p_start}' AND START_TIME < '{p_end}' AND AGENT_DATABASE_NAME IS NOT NULL
-        GROUP BY 1, 2
-        UNION ALL
-        SELECT DATE(USAGE_DATE), DATABASE_NAME, SUM(CREDITS)
-        FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_SEARCH_DAILY_USAGE_HISTORY
-        WHERE USAGE_DATE >= '{p_start}' AND USAGE_DATE < '{p_end}' AND DATABASE_NAME IS NOT NULL
-        GROUP BY 1, 2
-    )
-    SELECT USAGE_DATE, DIMENSION, ROUND(SUM(CREDITS), 4) AS CREDITS FROM db_data GROUP BY 1, 2 ORDER BY 1
-    """
-    color_field = "DIMENSION"
-    chart_title = "Daily Credits by Database"
-else:
-    trend_sql = f"""
-    WITH daily_data AS (
-        SELECT DATE(START_TIME) AS usage_date, 'Cortex Agents' AS service, SUM(TOKEN_CREDITS) AS credits
-        FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_AGENT_USAGE_HISTORY
-        WHERE START_TIME >= '{p_start}' AND START_TIME < '{p_end}' GROUP BY DATE(START_TIME)
-        UNION ALL
-        SELECT DATE(START_TIME), 'AI Functions', SUM(CREDITS)
-        FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_AI_FUNCTIONS_USAGE_HISTORY
-        WHERE START_TIME >= '{p_start}' AND START_TIME < '{p_end}' GROUP BY DATE(START_TIME)
-        UNION ALL
-        SELECT DATE(START_TIME), 'Cortex Analyst', SUM(CREDITS)
-        FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_ANALYST_USAGE_HISTORY
-        WHERE START_TIME >= '{p_start}' AND START_TIME < '{p_end}' GROUP BY DATE(START_TIME)
-        UNION ALL
-        SELECT DATE(USAGE_DATE), 'Cortex Search', SUM(CREDITS)
-        FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_SEARCH_DAILY_USAGE_HISTORY
-        WHERE USAGE_DATE >= '{p_start}' AND USAGE_DATE < '{p_end}' GROUP BY DATE(USAGE_DATE)
-        UNION ALL
-        SELECT DATE(USAGE_TIME), 'Cortex Code (Snowsight)', SUM(TOKEN_CREDITS)
-        FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_CODE_SNOWSIGHT_USAGE_HISTORY
-        WHERE USAGE_TIME >= '{p_start}' AND USAGE_TIME < '{p_end}' GROUP BY DATE(USAGE_TIME)
-        UNION ALL
-        SELECT DATE(USAGE_TIME), 'Cortex Code (CLI)', SUM(TOKEN_CREDITS)
-        FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_CODE_CLI_USAGE_HISTORY
-        WHERE USAGE_TIME >= '{p_start}' AND USAGE_TIME < '{p_end}' GROUP BY DATE(USAGE_TIME)
-        UNION ALL
-        SELECT DATE(USAGE_TIME), 'Cortex Code (Desktop)', SUM(TOKEN_CREDITS)
-        FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_CODE_DESKTOP_USAGE_HISTORY
-        WHERE USAGE_TIME >= '{p_start}' AND USAGE_TIME < '{p_end}' GROUP BY DATE(USAGE_TIME)
-        UNION ALL
-        SELECT DATE(START_TIME), 'Snowflake CoWork', SUM(TOKEN_CREDITS)
-        FROM SNOWFLAKE.ACCOUNT_USAGE.SNOWFLAKE_COWORK_USAGE_HISTORY
-        WHERE START_TIME >= '{p_start}' AND START_TIME < '{p_end}' GROUP BY DATE(START_TIME)
-    )
-    SELECT USAGE_DATE, SERVICE AS DIMENSION, ROUND(CREDITS, 4) AS CREDITS FROM daily_data ORDER BY USAGE_DATE
-    """
-    color_field = "DIMENSION"
-    chart_title = "Daily Credits by Service"
-
-df_trend = run(trend_sql, p_start, p_end)
-
-#Line chart with series    
-if not df_trend.empty:
-    stacked = alt.Chart(df_trend).mark_area(opacity=0.7).encode(
-        x=alt.X("USAGE_DATE:T", title="Date"),
-        y=alt.Y("CREDITS:Q", stack="zero", title="Credits"),
-        #color=alt.Color(f"{color_field}:N", title=chart_title.split("by ")[-1]),
-        color=alt.Color(f"{color_field}:N", title=chart_title.split("by ")[-1], scale=alt.Scale(domain=list(service_colors.keys()), range=list(service_colors.values()))),
-        tooltip=["USAGE_DATE:T", f"{color_field}:N", "CREDITS:Q"]
-    ).properties(height=350)
-    st.altair_chart(stacked, use_container_width=True)
-else:
-    st.info("No daily trend data in selected period.")
+_loading["Overview"].empty()
 
 # ----------------------------------------------------------------------
 # Per-user usage (shared by Cost Efficiency, Top Users, Cost-per-Request)
@@ -847,81 +992,62 @@ def cpr_chart(df: pd.DataFrame, y_field: str, x_title: str, height: int, show_le
     ).properties(height=height)
 
 
-# ----------------------------------------------------------------------
-# Cost Efficiency
-# ----------------------------------------------------------------------
+with _main_tabs["Efficiency"]:
+    # ----------------------------------------------------------------------
+    # Cost Efficiency
+    # ----------------------------------------------------------------------
 
-st.divider()
-st.subheader("Cost Efficiency by Service")
+    st.subheader("Cost Efficiency by Service")
 
-efficiency_sql = f"""
-{user_usage_cte}
-SELECT service AS SERVICE, ROUND(SUM(credits), 6) AS TOTAL_CREDITS, {REQUESTS_EXPR} AS TOTAL_REQUESTS
-FROM user_usage
-WHERE service <> 'Cortex Search'
-GROUP BY 1
-"""
-
-df_eff = run(efficiency_sql, p_start, p_end)
-if not df_eff.empty:
-    df_eff = add_cost_per_request(df_eff)
-
-if not df_eff.empty:
-    eff_cols = ["SERVICE", "UNIT", "TOTAL_CREDITS", "TOTAL_REQUESTS", "COST_PER_REQUEST"]
-    e1, e2 = st.columns([2, 1])
-    with e1:
-        st.markdown('<div class="panel-title">Interactive services: credits per request</div>', unsafe_allow_html=True)
-        df_int = df_eff[df_eff["SERVICE"].isin(INTERACTIVE_SERVICES)]
-        if not df_int.empty:
-            st.altair_chart(cpr_chart(df_int, "SERVICE", "Credits per Request", 220, show_legend=True), use_container_width=True)
-        else:
-            st.info("No interactive requests in selected period.")
-    with e2:
-        st.markdown('<div class="panel-title">AI Functions: credits per SQL query</div>', unsafe_allow_html=True)
-        df_batch = df_eff[df_eff["SERVICE"].isin(BATCH_SERVICES)]
-        if not df_batch.empty:
-            st.altair_chart(cpr_chart(df_batch, "SERVICE", "Credits per SQL Query", 220), use_container_width=True)
-        else:
-            st.info("No AI Function queries in selected period.")
-    st.dataframe(df_eff[eff_cols].reset_index(drop=True), use_container_width=True, hide_index=True)
-    st.caption(
-        "Units differ by service. An AI Functions query can process many rows, so its cost per query "
-        "is not comparable to a single agent or Code request. Cortex Search has no request count and is excluded."
-    )
-else:
-    st.info("No request data in selected period.")
-
-# ----------------------------------------------------------------------
-# Users by credit
-# ----------------------------------------------------------------------
-
-st.divider()
-st.subheader("Top Users by AI Credits")
-
-TAB_SERVICES = ["Cortex Agents", "Snowflake CoWork", "AI Functions", "Cortex Analyst",
-                "Cortex Code (Snowsight)", "Cortex Code (CLI)", "Cortex Code (Desktop)"]
-tabs = st.tabs(["Total AI Use"] + TAB_SERVICES)
-
-with tabs[0]:
-    st.dataframe(run(f"""
+    efficiency_sql = f"""
     {user_usage_cte}
-    SELECT user_name AS USER_NAME,
-           ROUND(SUM(credits), 4) AS TOTAL_CREDITS,
-           SUM(tokens) AS TOTAL_TOKENS,
-           {REQUESTS_EXPR} AS REQUESTS
+    SELECT service AS SERVICE, ROUND(SUM(credits), 6) AS TOTAL_CREDITS, {REQUESTS_EXPR} AS TOTAL_REQUESTS
     FROM user_usage
+    WHERE service <> 'Cortex Search'
     GROUP BY 1
-    ORDER BY TOTAL_CREDITS DESC
-    """, p_start, p_end), use_container_width=True, hide_index=True)
-    st.caption(
-        "Includes every service, so the column total matches Total AI Credits. "
-        "Cortex Search is billed per service, not per user. SYSTEM is Snowflake's internal user (USER_ID 0). "
-        "Requests mix units across services; see Cost Efficiency for per-service units. "
-        "AI Functions does not report tokens."
-    )
+    """
 
-for tab, svc in zip(tabs[1:], TAB_SERVICES):
-    with tab:
+    df_eff = run(efficiency_sql, p_start, p_end)
+    if not df_eff.empty:
+        df_eff = add_cost_per_request(df_eff)
+
+    if not df_eff.empty:
+        eff_cols = ["SERVICE", "UNIT", "TOTAL_CREDITS", "TOTAL_REQUESTS", "COST_PER_REQUEST"]
+        e1, e2 = st.columns([2, 1])
+        with e1:
+            st.markdown('<div class="panel-title">Interactive services: credits per request</div>', unsafe_allow_html=True)
+            df_int = df_eff[df_eff["SERVICE"].isin(INTERACTIVE_SERVICES)]
+            if not df_int.empty:
+                st.altair_chart(cpr_chart(df_int, "SERVICE", "Credits per Request", 220, show_legend=True), use_container_width=True)
+            else:
+                st.info("No interactive requests in selected period.")
+        with e2:
+            st.markdown('<div class="panel-title">AI Functions: credits per SQL query</div>', unsafe_allow_html=True)
+            df_batch = df_eff[df_eff["SERVICE"].isin(BATCH_SERVICES)]
+            if not df_batch.empty:
+                st.altair_chart(cpr_chart(df_batch, "SERVICE", "Credits per SQL Query", 220), use_container_width=True)
+            else:
+                st.info("No AI Function queries in selected period.")
+        st.dataframe(df_eff[eff_cols].reset_index(drop=True), use_container_width=True, hide_index=True)
+        info_text(
+            "Units differ by service. An AI Functions query can process many rows, so its cost per query "
+            "is not comparable to a single agent or Code request. Cortex Search has no request count and is excluded."
+        )
+    else:
+        st.info("No request data in selected period.")
+
+with _main_tabs["Users"]:
+    # ----------------------------------------------------------------------
+    # Users by credit
+    # ----------------------------------------------------------------------
+
+    st.subheader("Top Users by AI Credits")
+
+    TAB_SERVICES = ["Cortex Agents", "Snowflake CoWork", "AI Functions", "Cortex Analyst",
+                    "Cortex Code (Snowsight)", "Cortex Code (CLI)", "Cortex Code (Desktop)"]
+    tabs = st.tabs(["Total AI Use"] + TAB_SERVICES)
+
+    with tabs[0]:
         st.dataframe(run(f"""
         {user_usage_cte}
         SELECT user_name AS USER_NAME,
@@ -929,11 +1055,32 @@ for tab, svc in zip(tabs[1:], TAB_SERVICES):
                SUM(tokens) AS TOTAL_TOKENS,
                {REQUESTS_EXPR} AS REQUESTS
         FROM user_usage
-        WHERE service = '{svc}'
         GROUP BY 1
         ORDER BY TOTAL_CREDITS DESC
         """, p_start, p_end), use_container_width=True, hide_index=True)
-        st.caption(f"Requests counted per {SERVICE_UNITS[svc]}.")
+        info_text(
+            "Includes every service, so the column total matches Total AI Credits. "
+            "Cortex Search is billed per service, not per user. SYSTEM is Snowflake's internal user (USER_ID 0). "
+            "Requests mix units across services; see Cost Efficiency for per-service units. "
+            "AI Functions does not report tokens."
+        )
+
+    for tab, svc in zip(tabs[1:], TAB_SERVICES):
+        with tab:
+            st.dataframe(run(f"""
+            {user_usage_cte}
+            SELECT user_name AS USER_NAME,
+                   ROUND(SUM(credits), 4) AS TOTAL_CREDITS,
+                   SUM(tokens) AS TOTAL_TOKENS,
+                   {REQUESTS_EXPR} AS REQUESTS
+            FROM user_usage
+            WHERE service = '{svc}'
+            GROUP BY 1
+            ORDER BY TOTAL_CREDITS DESC
+            """, p_start, p_end), use_container_width=True, hide_index=True)
+            info_text(f"Requests counted per {SERVICE_UNITS[svc]}.")
+
+_loading["Users"].empty()
 
 # ----------------------------------------------------------------------
 # AI Quota Status
@@ -960,6 +1107,55 @@ def _limit(cfg: pd.DataFrame, col: str) -> Optional[float]:
     if col not in cfg.columns or pd.isna(cfg[col].iloc[0]):
         return None
     return float(cfg[col].iloc[0])
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def _unlimited_spend(names: tuple, since_utc: str) -> pd.DataFrame:
+    """Hourly AI spend from ACCOUNT_USAGE for users the quota excludes, in the quota's
+    domains. Names are bound as parameters; since_utc is an app-generated timestamp."""
+    ph = ", ".join("?" for _ in names)
+    sql = f"""
+        WITH u AS (
+            SELECT USER_NAME AS n, 'CORTEX AGENT' AS d, TOKEN_CREDITS AS c, START_TIME::TIMESTAMP_TZ AS t
+              FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_AGENT_USAGE_HISTORY
+             WHERE START_TIME >= '{since_utc}'::TIMESTAMP_TZ
+            UNION ALL
+            SELECT x.NAME, 'AI FUNCTION', h.CREDITS, h.START_TIME::TIMESTAMP_TZ
+              FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_AI_FUNCTIONS_USAGE_HISTORY h
+              JOIN SNOWFLAKE.ACCOUNT_USAGE.USERS x ON h.USER_ID = x.USER_ID
+             WHERE h.START_TIME >= '{since_utc}'::TIMESTAMP_TZ
+            UNION ALL
+            SELECT USER_NAME, 'SNOWFLAKE INTELLIGENCE', TOKEN_CREDITS, START_TIME::TIMESTAMP_TZ
+              FROM SNOWFLAKE.ACCOUNT_USAGE.SNOWFLAKE_COWORK_USAGE_HISTORY
+             WHERE START_TIME >= '{since_utc}'::TIMESTAMP_TZ
+            UNION ALL
+            SELECT x.NAME, 'CORTEX CODE', h.TOKEN_CREDITS, h.USAGE_TIME::TIMESTAMP_TZ
+              FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_CODE_SNOWSIGHT_USAGE_HISTORY h
+              JOIN SNOWFLAKE.ACCOUNT_USAGE.USERS x ON h.USER_ID = x.USER_ID
+             WHERE h.USAGE_TIME >= '{since_utc}'::TIMESTAMP_TZ
+            UNION ALL
+            SELECT x.NAME, 'CORTEX CODE', h.TOKEN_CREDITS, h.USAGE_TIME::TIMESTAMP_TZ
+              FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_CODE_CLI_USAGE_HISTORY h
+              JOIN SNOWFLAKE.ACCOUNT_USAGE.USERS x ON h.USER_ID = x.USER_ID
+             WHERE h.USAGE_TIME >= '{since_utc}'::TIMESTAMP_TZ
+            UNION ALL
+            SELECT USER_NAME, 'CORTEX CODE', TOKEN_CREDITS, USAGE_TIME::TIMESTAMP_TZ
+              FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_CODE_DESKTOP_USAGE_HISTORY
+             WHERE USAGE_TIME >= '{since_utc}'::TIMESTAMP_TZ
+        )
+        SELECT n AS USER_NAME, d AS ENTITY_TYPE, SUM(c) AS CREDITS_SPEND,
+               DATE_TRUNC('hour', CONVERT_TIMEZONE('UTC', t)) AS HOUR_UTC
+          FROM u WHERE n IN ({ph})
+         GROUP BY 1, 2, 4
+    """
+    rows = session.sql(sql, params=list(names)).collect()
+    df = pd.DataFrame([r.as_dict() for r in rows])
+    if df.empty:
+        return pd.DataFrame(columns=["USER_NAME", "ENTITY_TYPE", "CREDITS_SPEND", "TS"])
+    df.columns = [str(c).upper() for c in df.columns]
+    df["CREDITS_SPEND"] = df["CREDITS_SPEND"].astype(float)
+    df["TS"] = pd.to_datetime(df["HOUR_UTC"], utc=True)
+    return df
 
 
 def quota_status_section(fqn: str) -> None:
@@ -1031,6 +1227,8 @@ def quota_status_section(fqn: str) -> None:
         per_user["MONTH_BY_DOMAIN"] = by_domain.groupby("USER_NAME")["TXT"].agg(", ".join)
     else:
         per_user = pd.DataFrame(columns=["MONTH", "WEEK", "DAY", "MONTH_BY_DOMAIN"])
+    # Quota-counted spend only; "not limited" rows added below are not part of it.
+    quota_total = float(per_user["MONTH"].sum()) if not per_user.empty else 0.0
 
     # Blocked users appear even if their spend falls outside the fetched window.
     block_text = {}
@@ -1042,16 +1240,54 @@ def quota_status_section(fqn: str) -> None:
             if u not in per_user.index:
                 per_user.loc[u] = [0.0, 0.0, 0.0, ""]
 
+    # Full roster: every user the quota covers, at 0 if they have no spend. GET_USERS also
+    # returns internal RESOURCE_PLACEHOLDER entries and users dropped this month, so keep
+    # only active account users.
+    roster = _sql_cached(f"CALL {fqn}!GET_USERS()")
+    active = set(_sql_cached(
+        "SELECT UPPER(NAME) AS NAME FROM SNOWFLAKE.ACCOUNT_USAGE.USERS WHERE DELETED_ON IS NULL"
+    ).get("NAME", pd.Series(dtype=str)))
+    roster_names = sorted({
+        n for n in roster.get("USER_NAME", pd.Series(dtype=str)).dropna()
+        if n != "RESOURCE_PLACEHOLDER" and n.upper() in active
+    })
+    for u in roster_names:
+        if u not in per_user.index:
+            per_user.loc[u] = [0.0, 0.0, 0.0, ""]
+
+    # Excluded users: the quota does not track them, so their spend comes from ACCOUNT_USAGE
+    # for the same domains and cycles, shown for comparison as "Not limited".
+    unlimited = [u for u in excluded if u]
+    if unlimited:
+        unl = _unlimited_spend(tuple(unlimited), f"{fetch_start:%Y-%m-%d %H:%M:%S} +00:00")
+        for u in unlimited:
+            rows = unl[unl["USER_NAME"] == u] if not unl.empty else unl
+            m = rows[rows["TS"] >= month_start] if not rows.empty else rows
+            dom = (
+                m.groupby("ENTITY_TYPE")["CREDITS_SPEND"].sum()
+                if not m.empty else pd.Series(dtype=float)
+            )
+            per_user.loc[u] = [
+                float(m["CREDITS_SPEND"].sum()) if not m.empty else 0.0,
+                float(rows[rows["TS"] >= week_start]["CREDITS_SPEND"].sum()) if not rows.empty else 0.0,
+                float(rows[rows["TS"] >= day_start]["CREDITS_SPEND"].sum()) if not rows.empty else 0.0,
+                ", ".join(f"{e} {c:,.2f}" for e, c in dom.items()),
+            ]
+
     if per_user.empty:
-        st.info("No quota-counted spend in the current cycles.")
+        st.info("No users in scope and no quota-counted spend in the current cycles.")
     else:
         for cyc, lim in limits.items():
-            per_user[f"{cyc}_PCT"] = (per_user[cyc] / lim * 100).round(1) if lim else None
+            per_user[f"{cyc}_PCT"] = (per_user[cyc].astype(float) / lim * 100).round(1) if lim else None
+            if unlimited:
+                per_user.loc[per_user.index.isin(unlimited), f"{cyc}_PCT"] = None
 
         def status(row):
+            if row.name in unlimited:
+                return "Not limited (excluded)"
             if row.name in block_text:
                 return "Blocked: " + "; ".join(block_text[row.name])
-            pcts = [row[f"{c}_PCT"] for c in limits if limits[c]]
+            pcts = [row[f"{c}_PCT"] for c in limits if limits[c] and pd.notna(row[f"{c}_PCT"])]
             worst = max(pcts) if pcts else 0
             if worst >= 100:
                 return "Over limit"
@@ -1062,15 +1298,19 @@ def quota_status_section(fqn: str) -> None:
         per_user["STATUS"] = per_user.apply(status, axis=1)
         table = (
             per_user.reset_index().rename(columns={"index": "USER_NAME"})
-            .sort_values(["MONTH_PCT", "MONTH"] if limits["MONTH"] else ["MONTH"], ascending=False)
+            .sort_values(["MONTH_PCT", "MONTH"] if limits["MONTH"] else ["MONTH"], ascending=False, na_position="last")
         )
         for cyc in limits:
-            table[cyc] = table[cyc].round(4)
-        # Top 10 by % of monthly limit; blocked users are always kept so a block is never hidden.
+            table[cyc] = table[cyc].astype(float).round(4)
+        # Top 10 by % of monthly limit unless "show all" is ticked. Blocked and
+        # not-limited users are always kept so they are never hidden.
         total_users = len(table)
         top_n = 10
+        show_all = st.checkbox(f"Show all {total_users} users", value=False, key="quota_show_all")
         table = table.reset_index(drop=True)
-        table = table[(table.index < top_n) | table["STATUS"].str.startswith("Blocked")]
+        if not show_all:
+            keep = table["STATUS"].str.startswith("Blocked") | table["STATUS"].str.startswith("Not limited")
+            table = table[(table.index < top_n) | keep]
         cols = ["USER_NAME", "STATUS", "MONTH", "MONTH_PCT", "WEEK", "WEEK_PCT", "DAY", "DAY_PCT", "MONTH_BY_DOMAIN"]
         table = table[cols].reset_index(drop=True)
 
@@ -1105,7 +1345,10 @@ def quota_status_section(fqn: str) -> None:
         )
         st.dataframe(styled, use_container_width=True, hide_index=True)
         if total_users > len(table):
-            st.caption(f"Showing the top {top_n} of {total_users} users by % of the monthly limit (plus any blocked users).")
+            info_text(
+                f"Showing the top {top_n} of {total_users} users by % of the monthly limit "
+                "(plus any blocked or not-limited users). Tick 'Show all' to see everyone, including users at 0."
+            )
 
     # Reconcile with the rest of the app: AI credits this UTC month that the quota does not count.
     ms = f"{month_start:%Y-%m-%d %H:%M:%S} +00:00"
@@ -1116,97 +1359,227 @@ def quota_status_section(fqn: str) -> None:
             (SELECT COALESCE(SUM(CREDITS), 0) FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_ANALYST_USAGE_HISTORY
               WHERE START_TIME >= '{ms}'::TIMESTAMP_TZ) AS ANALYST_CREDITS
     """)
-    quota_total = float(per_user["MONTH"].sum()) if not per_user.empty else 0.0
-    st.caption(
+    info_text(
         f"Quota-counted spend this UTC month: {quota_total:,.2f} credits. Not counted by the quota: "
         f"Cortex Search {float(mtd['SEARCH_CREDITS'].iloc[0]):,.2f}, Cortex Analyst API "
-        f"{float(mtd['ANALYST_CREDITS'].iloc[0]):,.2f}, and all spend by users who are not limited "
-        f"({', '.join(excluded) or 'none'}). Figures refresh every 15 minutes; quota evaluation itself lags spend."
+        f"{float(mtd['ANALYST_CREDITS'].iloc[0]):,.2f}, and spend by users marked 'Not limited' "
+        f"({', '.join(excluded) or 'none'}); their rows come from ACCOUNT_USAGE, which can lag by hours. "
+        "Users at 0 are active users the quota covers with no spend this month. "
+        "Figures refresh every 15 minutes; quota evaluation itself lags spend."
     )
 
 
-def quota_state(fqn: str) -> tuple:
-    """Return ("ok" | "absent" | "error", detail).
-
-    Reading the quota is the existence test. The section is hidden ("absent") only when
-    SHOW succeeds and confirms there is no quota by that name; any other failure is
-    reported, never hidden. Not cached, so a one-off empty result can't stick.
-    """
-    db, schema, name = fqn.split(".")
-    try:
-        session.sql(f"CALL {fqn}!GET_CONFIG()").collect()
-        return "ok", None
-    except Exception as call_err:
-        try:
-            rows = session.sql(f"SHOW SNOWFLAKE.CORE.QUOTA INSTANCES LIKE '{name}' IN SCHEMA {db}.{schema}").collect()
-        except Exception as show_err:
-            # Missing database or schema: the quota does not exist either.
-            if "does not exist" in str(show_err).lower():
-                return "absent", None
-            return "error", f"GET_CONFIG failed: {call_err} | SHOW failed: {show_err}"
-        # LIKE treats "_" as a wildcard, so confirm the exact name.
-        if not any(str(r.as_dict().get("name", "")).upper() == name.upper() for r in rows):
-            return "absent", None
-        return "error", f"The quota exists but could not be read: {call_err}"
+if _show_quota_tab:
+    with _main_tabs["Quota"]:
+        st.subheader("AI Quota Status")
+        if _quota_state == "error":
+            st.warning(
+                f"Could not read quota {quota_fqn}. The app runs as its owner role, which needs VIEWER on the quota "
+                f"(GRANT SNOWFLAKE.CORE.QUOTA ROLE {quota_fqn}!VIEWER TO ROLE <owner role>). Details: {_quota_detail}"
+            )
+        else:
+            try:
+                quota_status_section(quota_fqn)
+            except Exception as e:
+                st.warning(f"Could not display quota {quota_fqn}. Details: {e}")
 
 
-_quota_state, _quota_detail = quota_state(quota_fqn) if quota_fqn else ("absent", None)
+if _show_quota_tab:
+    _loading["Quota"].empty()
 
-if _quota_state != "absent":
+with _main_tabs["Efficiency"]:
+    # ----------------------------------------------------------------------
+    # Users by Highest Service/Cost
+    # ----------------------------------------------------------------------
+
     st.divider()
-    st.subheader("AI Quota Status")
-    if _quota_state == "error":
-        st.warning(
-            f"Could not read quota {quota_fqn}. The app runs as its owner role, which needs VIEWER on the quota "
-            f"(GRANT SNOWFLAKE.CORE.QUOTA ROLE {quota_fqn}!VIEWER TO ROLE <owner role>). Details: {_quota_detail}"
-        )
+    st.subheader("Highest Cost-per-Request by User")
+
+    user_eff_sql = f"""
+    {user_usage_cte}
+    SELECT user_name AS USER_NAME, service AS SERVICE, ROUND(SUM(credits), 6) AS TOTAL_CREDITS, {REQUESTS_EXPR} AS TOTAL_REQUESTS
+    FROM user_usage
+    WHERE service <> 'Cortex Search'
+    GROUP BY 1, 2
+    """
+
+    df_user_eff = run(user_eff_sql, p_start, p_end)
+    if not df_user_eff.empty:
+        df_user_eff = add_cost_per_request(df_user_eff)
+
+    if not df_user_eff.empty:
+        df_user_eff["LABEL"] = df_user_eff["USER_NAME"].fillna("Unknown") + " (" + df_user_eff["SERVICE"] + ")"
+        user_cols = ["USER_NAME", "SERVICE", "UNIT", "TOTAL_CREDITS", "TOTAL_REQUESTS", "COST_PER_REQUEST"]
+        u1, u2 = st.columns(2)
+        with u1:
+            st.markdown('<div class="panel-title">Interactive services: credits per request (top 15)</div>', unsafe_allow_html=True)
+            df_u_int = df_user_eff[df_user_eff["SERVICE"].isin(INTERACTIVE_SERVICES)].head(15)
+            if not df_u_int.empty:
+                st.altair_chart(cpr_chart(df_u_int, "LABEL", "Credits per Request", 400, show_legend=True), use_container_width=True)
+                st.dataframe(df_u_int[user_cols].reset_index(drop=True), use_container_width=True, hide_index=True)
+            else:
+                st.info("No interactive requests in selected period.")
+        with u2:
+            st.markdown('<div class="panel-title">AI Functions: credits per SQL query (top 15)</div>', unsafe_allow_html=True)
+            df_u_batch = df_user_eff[df_user_eff["SERVICE"].isin(BATCH_SERVICES)].head(15)
+            if not df_u_batch.empty:
+                st.altair_chart(cpr_chart(df_u_batch, "LABEL", "Credits per SQL Query", 400), use_container_width=True)
+                st.dataframe(df_u_batch[user_cols].reset_index(drop=True), use_container_width=True, hide_index=True)
+            else:
+                st.info("No AI Function queries in selected period.")
     else:
+        st.info("No user request data in selected period.")
+
+_loading["Efficiency"].empty()
+
+# ----------------------------------------------------------------------
+# Admin: change quota limits and blocking (allow-listed users only)
+# Every attempt is written to quota_change_log; without that table no change
+# is allowed. Values are validated and passed as numbers/booleans, never text.
+# ----------------------------------------------------------------------
+
+_CYCLES = {"MONTH": ("MONTHLY", "PER_USER_LIMIT"), "WEEK": ("WEEKLY", "PER_USER_LIMIT_WEEKLY"), "DAY": ("DAILY", "PER_USER_LIMIT_DAILY")}
+_MAX_LIMIT = 1_000_000_000
+
+
+def _log_change(setting: str, old, new, status: str, error: Optional[str] = None) -> None:
+    session.sql(
+        f"INSERT INTO {quota_change_log} (CHANGED_BY, QUOTA_FQN, SETTING, OLD_VALUE, NEW_VALUE, STATUS, ERROR) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        params=[viewer_name(), quota_fqn, setting,
+                None if old is None else str(old), None if new is None else str(new),
+                status, None if error is None else str(error)[:2000]],
+    ).collect()
+
+
+def _fmt(v) -> str:
+    return "no limit" if v is None else f"{v:,.0f}"
+
+
+def admin_section() -> bool:
+    """Render the Admin tab. Returns True when changes were applied and the page should rerun."""
+    st.subheader("Quota settings")
+    info_text(
+        f"Signed in as {viewer_name()}. Changes apply to {quota_fqn} for every user it covers "
+        "(one limit per cycle for everyone) and are recorded in "
+        f"{quota_change_log or 'the change log'}. Users, exclusions and tracked services are managed in Snowsight."
+    )
+
+    for msg_type, msg in st.session_state.pop("quota_admin_results", []):
+        (st.success if msg_type == "ok" else st.error)(msg)
+
+    if not quota_change_log:
+        st.error("No valid quota_change_log configured, so changes are disabled.")
+        return
+    try:
+        session.sql(f"SELECT 1 FROM {quota_change_log} LIMIT 0").collect()
+    except Exception as e:
+        st.error(f"Change log {quota_change_log} is not available, so changes are disabled. Details: {e}")
+        return
+
+    # Read current settings fresh (not cached) so the form compares against the live values.
+    cur = session.sql(f"CALL {quota_fqn}!GET_CONFIG()").collect()[0].as_dict()
+    cur = {str(k).upper(): v for k, v in cur.items()}
+    current = {c: (None if cur.get(col) is None else float(cur[col])) for c, (_, col) in _CYCLES.items()}
+    cur_enf = bool(cur.get("BLOCK_ENFORCEMENT_ENABLED"))
+    cur_mail = bool(cur.get("PER_USER_BLOCK_NOTIFICATIONS_ENABLED"))
+
+    with st.form("quota_admin_form"):
+        # Widget keys include the live value, so a change made elsewhere (e.g. in Snowsight)
+        # resets the form instead of letting a stale value be re-applied.
+        cols = st.columns(3)
+        new_vals = {}
+        for col, (cyc, label) in zip(cols, [("MONTH", "Monthly"), ("WEEK", "Weekly"), ("DAY", "Daily")]):
+            with col:
+                st.markdown(f"**{label} limit** · current: {_fmt(current[cyc])}")
+                no_limit = st.checkbox("No limit", value=current[cyc] is None, key=f"qa_none_{cyc}_{current[cyc]}")
+                val = st.number_input(
+                    "Credits per user", min_value=1, max_value=_MAX_LIMIT, step=1,
+                    value=int(current[cyc]) if current[cyc] else 1, key=f"qa_val_{cyc}_{current[cyc]}",
+                )
+                new_vals[cyc] = None if no_limit else int(val)
+        st.markdown(f"**Blocking** · current: enforcement {'ON' if cur_enf else 'OFF'}, "
+                    f"block emails {'ON' if cur_mail else 'OFF'}")
+        new_enf = st.checkbox("Block users who reach a limit", value=cur_enf, key=f"qa_enf_{cur_enf}")
+        new_mail = st.checkbox("Email users when they are blocked or unblocked", value=cur_mail, key=f"qa_mail_{cur_mail}")
+        confirm = st.checkbox("I confirm these changes apply to every user covered by this quota", key="qa_confirm")
+        submitted = st.form_submit_button("Apply changes")
+
+    if submitted:
+        # Re-check on submit: the allow-list is the only guard on owner's-rights calls.
+        if not is_quota_admin():
+            st.error("You are not allowed to change quota settings.")
+            return
+        changes = []
+        for cyc, (cycle, _) in _CYCLES.items():
+            old, new = current[cyc], new_vals[cyc]
+            if (old is None and new is None) or (old is not None and new is not None and int(old) == new):
+                continue
+            if new is None:
+                changes.append((f"{cycle} limit", _fmt(old), "no limit",
+                                f"CALL {quota_fqn}!UNSET_PER_USER_LIMIT('{cycle}')"))
+            else:
+                if not 1 <= new <= _MAX_LIMIT:
+                    st.error(f"{cycle} limit must be a whole number from 1 to {_MAX_LIMIT:,}.")
+                    return
+                changes.append((f"{cycle} limit", _fmt(old), f"{new:,}",
+                                f"CALL {quota_fqn}!SET_PER_USER_LIMIT({int(new)}, '{cycle}')"))
+        if (new_enf, new_mail) != (cur_enf, cur_mail):
+            # Always pass both arguments; the one-argument form turns block emails off.
+            changes.append(("Block enforcement / emails",
+                            f"{'ON' if cur_enf else 'OFF'} / {'ON' if cur_mail else 'OFF'}",
+                            f"{'ON' if new_enf else 'OFF'} / {'ON' if new_mail else 'OFF'}",
+                            f"CALL {quota_fqn}!SET_BLOCK_ENFORCEMENT_ENABLED({'TRUE' if new_enf else 'FALSE'}, "
+                            f"{'TRUE' if new_mail else 'FALSE'})"))
+
+        if not changes:
+            st.info("Nothing to change: the form matches the current settings.")
+        elif not confirm:
+            st.warning("Tick the confirmation box to apply the changes.")
+        else:
+            results = []
+            for setting, old, new, sql in changes:
+                try:
+                    session.sql(sql).collect()
+                    _log_change(setting, old, new, "SUCCESS")
+                    results.append(("ok", f"{setting}: {old} → {new}"))
+                except Exception as e:
+                    try:
+                        _log_change(setting, old, new, "FAILED", e)
+                    except Exception:
+                        pass
+                    results.append(("err", f"{setting}: failed to change {old} → {new}. Details: {e}"))
+            _sql_cached.clear()  # so the Quota tab shows the new limits
+            st.session_state["quota_admin_results"] = results
+            st.session_state.pop("qa_confirm", None)
+            return True  # caller reruns outside any try/except
+
+    st.markdown("**Recent changes**")
+    try:
+        log = session.sql(
+            f"SELECT CHANGED_AT, CHANGED_BY, SETTING, OLD_VALUE, NEW_VALUE, STATUS, ERROR "
+            f"FROM {quota_change_log} WHERE QUOTA_FQN = ? ORDER BY CHANGED_AT DESC LIMIT 20",
+            params=[quota_fqn],
+        ).to_pandas()
+        if log.empty:
+            info_text("No changes recorded yet.")
+        else:
+            st.dataframe(log, use_container_width=True, hide_index=True)
+    except Exception as e:
+        st.warning(f"Could not read {quota_change_log}. Details: {e}")
+    return False
+
+
+if _show_admin_tab:
+    _admin_rerun = False
+    with _main_tabs["Admin"]:
         try:
-            quota_status_section(quota_fqn)
+            _admin_rerun = admin_section()
         except Exception as e:
-            st.warning(f"Could not display quota {quota_fqn}. Details: {e}")
-
-# ----------------------------------------------------------------------
-# Users by Highest Service/Cost
-# ----------------------------------------------------------------------
-
-st.divider()
-st.subheader("Highest Cost-per-Request by User")
-
-user_eff_sql = f"""
-{user_usage_cte}
-SELECT user_name AS USER_NAME, service AS SERVICE, ROUND(SUM(credits), 6) AS TOTAL_CREDITS, {REQUESTS_EXPR} AS TOTAL_REQUESTS
-FROM user_usage
-WHERE service <> 'Cortex Search'
-GROUP BY 1, 2
-"""
-
-df_user_eff = run(user_eff_sql, p_start, p_end)
-if not df_user_eff.empty:
-    df_user_eff = add_cost_per_request(df_user_eff)
-
-if not df_user_eff.empty:
-    df_user_eff["LABEL"] = df_user_eff["USER_NAME"].fillna("Unknown") + " (" + df_user_eff["SERVICE"] + ")"
-    user_cols = ["USER_NAME", "SERVICE", "UNIT", "TOTAL_CREDITS", "TOTAL_REQUESTS", "COST_PER_REQUEST"]
-    u1, u2 = st.columns(2)
-    with u1:
-        st.markdown('<div class="panel-title">Interactive services: credits per request (top 15)</div>', unsafe_allow_html=True)
-        df_u_int = df_user_eff[df_user_eff["SERVICE"].isin(INTERACTIVE_SERVICES)].head(15)
-        if not df_u_int.empty:
-            st.altair_chart(cpr_chart(df_u_int, "LABEL", "Credits per Request", 400, show_legend=True), use_container_width=True)
-            st.dataframe(df_u_int[user_cols].reset_index(drop=True), use_container_width=True, hide_index=True)
-        else:
-            st.info("No interactive requests in selected period.")
-    with u2:
-        st.markdown('<div class="panel-title">AI Functions: credits per SQL query (top 15)</div>', unsafe_allow_html=True)
-        df_u_batch = df_user_eff[df_user_eff["SERVICE"].isin(BATCH_SERVICES)].head(15)
-        if not df_u_batch.empty:
-            st.altair_chart(cpr_chart(df_u_batch, "LABEL", "Credits per SQL Query", 400), use_container_width=True)
-            st.dataframe(df_u_batch[user_cols].reset_index(drop=True), use_container_width=True, hide_index=True)
-        else:
-            st.info("No AI Function queries in selected period.")
-else:
-    st.info("No user request data in selected period.")
+            st.warning(f"Could not load quota settings. Details: {e}")
+    _loading["Admin"].empty()
+    if _admin_rerun:
+        st.rerun()  # outside the try so Streamlit's rerun signal is not swallowed
 
 # -------------------------------------------------
 # Notes

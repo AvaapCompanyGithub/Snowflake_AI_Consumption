@@ -4,5 +4,6 @@
   "credit_rate": 3.00,
   "credit_rate_label": "Enterprise",
   "default_date_range": "YTD",
-  "quota_fqn": "UTIL_DB.COSTS.AI_QUOTA"
+  "quota_fqn": "UTIL_DB.COSTS.AI_QUOTA",
+  "quota_admins": ["LMANCINI"]
 }
