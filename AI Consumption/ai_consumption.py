@@ -1256,7 +1256,7 @@ def quota_status_section(fqn: str) -> None:
             per_user.loc[u] = [0.0, 0.0, 0.0, ""]
 
     # Excluded users: the quota does not track them, so their spend comes from ACCOUNT_USAGE
-    # for the same domains and cycles, shown for comparison as "Not limited".
+    # for the same domains and cycles, shown for comparison with status EXCLUDED.
     unlimited = [u for u in excluded if u]
     if unlimited:
         unl = _unlimited_spend(tuple(unlimited), f"{fetch_start:%Y-%m-%d %H:%M:%S} +00:00")
@@ -1279,12 +1279,10 @@ def quota_status_section(fqn: str) -> None:
     else:
         for cyc, lim in limits.items():
             per_user[f"{cyc}_PCT"] = (per_user[cyc].astype(float) / lim * 100).round(1) if lim else None
-            if unlimited:
-                per_user.loc[per_user.index.isin(unlimited), f"{cyc}_PCT"] = None
 
         def status(row):
             if row.name in unlimited:
-                return "Not limited (excluded)"
+                return "EXCLUDED"
             if row.name in block_text:
                 return "Blocked: " + "; ".join(block_text[row.name])
             pcts = [row[f"{c}_PCT"] for c in limits if limits[c] and pd.notna(row[f"{c}_PCT"])]
@@ -1298,18 +1296,18 @@ def quota_status_section(fqn: str) -> None:
         per_user["STATUS"] = per_user.apply(status, axis=1)
         table = (
             per_user.reset_index().rename(columns={"index": "USER_NAME"})
-            .sort_values(["MONTH_PCT", "MONTH"] if limits["MONTH"] else ["MONTH"], ascending=False, na_position="last")
+            .sort_values(["MONTH", "USER_NAME"], ascending=[False, True])  # month credits, highest first, any status
         )
         for cyc in limits:
             table[cyc] = table[cyc].astype(float).round(4)
-        # Top 10 by % of monthly limit unless "show all" is ticked. Blocked and
-        # not-limited users are always kept so they are never hidden.
+        # Top 10 by month credits unless "show all" is ticked. Blocked and
+        # excluded users are always kept so they are never hidden.
         total_users = len(table)
         top_n = 10
         show_all = st.checkbox(f"Show all {total_users} users", value=False, key="quota_show_all")
         table = table.reset_index(drop=True)
         if not show_all:
-            keep = table["STATUS"].str.startswith("Blocked") | table["STATUS"].str.startswith("Not limited")
+            keep = table["STATUS"].str.startswith("Blocked") | (table["STATUS"] == "EXCLUDED")
             table = table[(table.index < top_n) | keep]
         cols = ["USER_NAME", "STATUS", "MONTH", "MONTH_PCT", "WEEK", "WEEK_PCT", "DAY", "DAY_PCT", "MONTH_BY_DOMAIN"]
         table = table[cols].reset_index(drop=True)
@@ -1332,8 +1330,13 @@ def quota_status_section(fqn: str) -> None:
 
         def highlight(row):
             s = row["Status"]
-            if s.startswith("Blocked") or s == "Over limit":
-                return ["background-color: #FDE8E8"] * len(row)
+            # Over the quota (at or above a limit, or blocked): red text on a red tint.
+            # EXCLUDED users aren't blocked, but still flag them if their spend exceeds a limit.
+            over_excluded = s == "EXCLUDED" and any(
+                pd.notna(row[c]) and row[c] >= 100 for c in pct_cols
+            )
+            if s.startswith("Blocked") or s == "Over limit" or over_excluded:
+                return [f"background-color: #FDE8E8; color: {RED}; font-weight: 700"] * len(row)
             if s.startswith("Warning"):
                 return ["background-color: #FFF4D6"] * len(row)
             return [""] * len(row)
@@ -1346,8 +1349,8 @@ def quota_status_section(fqn: str) -> None:
         st.dataframe(styled, use_container_width=True, hide_index=True)
         if total_users > len(table):
             info_text(
-                f"Showing the top {top_n} of {total_users} users by % of the monthly limit "
-                "(plus any blocked or not-limited users). Tick 'Show all' to see everyone, including users at 0."
+                f"Showing the top {top_n} of {total_users} users by month credits "
+                "(plus any blocked or excluded users). Tick 'Show all' to see everyone, including users at 0."
             )
 
     # Reconcile with the rest of the app: AI credits this UTC month that the quota does not count.
@@ -1362,8 +1365,9 @@ def quota_status_section(fqn: str) -> None:
     info_text(
         f"Quota-counted spend this UTC month: {quota_total:,.2f} credits. Not counted by the quota: "
         f"Cortex Search {float(mtd['SEARCH_CREDITS'].iloc[0]):,.2f}, Cortex Analyst API "
-        f"{float(mtd['ANALYST_CREDITS'].iloc[0]):,.2f}, and spend by users marked 'Not limited' "
+        f"{float(mtd['ANALYST_CREDITS'].iloc[0]):,.2f}, and spend by users marked EXCLUDED "
         f"({', '.join(excluded) or 'none'}); their rows come from ACCOUNT_USAGE, which can lag by hours. "
+        "EXCLUDED users are never blocked; their % shows spend against the limits for comparison. "
         "Users at 0 are active users the quota covers with no spend this month. "
         "Figures refresh every 15 minutes; quota evaluation itself lags spend."
     )
