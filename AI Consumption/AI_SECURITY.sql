@@ -18,11 +18,11 @@ create SNOWFLAKE INTELLIGENCE if not exists SNOWFLAKE_INTELLIGENCE_OBJECT_DEFAUL
 grant database role SNOWFLAKE.CORTEX_USER to role SYSADMIN;
 grant use AI FUNCTIONS on account to role SYSADMIN;
 grant application role SNOWFLAKE."CORTEX-MODEL-ROLE-ALL" to role SYSADMIN;
-grant usage on AI GATEWAY SNOWFLAKE to role SYSADMIN;
+grant usage on AI GATEWAY SNOWFLAKE to role SYSADMIN; --System grant shown as AI_GATEWAY / SNOWFLAKE
+grant EXECUTE AGENT TASK on account to role SYSADMIN; --CoWork and CoCo automations
 
 --SYSADMIN (owner of the AI Consumption app) can read AI Gateway usage (ACCOUNT_USAGE.AI_GATEWAY_USAGE_HISTORY).
 grant monitor on AI GATEWAY SNOWFLAKE to role SYSADMIN;
-
 --SYSADMIN can use the Intelligence Object through AI_USER, but not modify it (modify lets holders add/remove agents for the whole account).
 --grant modify on SNOWFLAKE INTELLIGENCE SNOWFLAKE_INTELLIGENCE_OBJECT_DEFAULT to role SYSADMIN;
 
@@ -36,11 +36,12 @@ show grants to role SYSADMIN;
 use role ACCOUNTADMIN;
 
 revoke database role SNOWFLAKE.CORTEX_USER from role PUBLIC;
-revoke database role SNOWFLAKE.COPILOT_USER from role PUBLIC;  --being retired by Snowflake, so not granted to the AI role below
+revoke database role SNOWFLAKE.COPILOT_USER from role PUBLIC; --being retired by Snowflake, so not granted to the AI role below
 revoke USE AI FUNCTIONS on account from role PUBLIC;
 revoke application role SNOWFLAKE."CORTEX-MODEL-ROLE-ALL" from role PUBLIC;
 call SNOWFLAKE.LOCAL.REVOKE_FROM_PUBLIC_APPLICATION_ROLE('APP_ROLE', 'CORTEX-MODEL-ROLE-ALL');
-revoke usage on ai gateway SNOWFLAKE from role PUBLIC;  --system grant shown as AI_GATEWAY / SNOWFLAKE
+revoke usage on ai gateway SNOWFLAKE from role PUBLIC; --System grant shown as AI_GATEWAY / SNOWFLAKE
+revoke execute agent task on account from role PUBLIC; --CoWork and CoCo automations
 
 --Check
 show grants to role PUBLIC; -- no CORTEX_USER, AI_FUNCTIONS_USER, CORTEX_EMBED_USER, CORTEX_AGENT_USER, USE AI FUNCTION*
@@ -56,6 +57,7 @@ grant database role SNOWFLAKE.COPILOT_USER to role PUBLIC;
 grant use ai functions on account to role PUBLIC;
 grant application role SNOWFLAKE."CORTEX-MODEL-ROLE-ALL" to role PUBLIC;
 grant usage on ai gateway SNOWFLAKE to role PUBLIC;
+grant execute agent task on account to role PUBLIC;
 
 --The REVOKE_FROM_PUBLIC_APPLICATION_ROLE call above has no documented undo procedure.
 --The PUBLIC grant above gives the same model access. If a model is still blocked, check with Snowflake support.
@@ -82,15 +84,15 @@ grant role identifier($AI_ROLE) to role SYSADMIN;
 use role ACCOUNTADMIN;
 
 grant database role SNOWFLAKE.CORTEX_USER to role identifier($AI_ROLE);
-grant use ai functions on account to role identifier($AI_ROLE);
+grant use AI FUNCTIONS on account to role identifier($AI_ROLE);
 grant application role SNOWFLAKE."CORTEX-MODEL-ROLE-ALL" to role identifier($AI_ROLE);
-grant usage on ai gateway SNOWFLAKE to role identifier($AI_ROLE);  --was revoked from PUBLIC above
+grant usage on AI GATEWAY SNOWFLAKE to role identifier($AI_ROLE);
+grant EXECUTE AGENT TASK on account to role identifier($AI_ROLE);
 
-grant usage on SNOWFLAKE INTELLIGENCE SNOWFLAKE_INTELLIGENCE_OBJECT_DEFAULT to role identifier($AI_ROLE);
-
---MODIFY intentionally not granted: it lets holders add/remove agents in Snowflake Intelligence for the whole account.
---Grant it directly to a specific admin role if needed:
---grant modify on SNOWFLAKE INTELLIGENCE SNOWFLAKE_INTELLIGENCE_OBJECT_DEFAULT to role <ROLE>;
+--SYSADMIN (owner of the AI Consumption app) can read AI Gateway usage (ACCOUNT_USAGE.AI_GATEWAY_USAGE_HISTORY).
+grant monitor on AI GATEWAY SNOWFLAKE to role identifier($AI_ROLE);
+--SYSADMIN can use the Intelligence Object through AI_USER, but not modify it (modify lets holders add/remove agents for the whole account).
+--grant modify on SNOWFLAKE INTELLIGENCE SNOWFLAKE_INTELLIGENCE_OBJECT_DEFAULT to role identifier($AI_ROLE);
 
 --Check
 show grants to role identifier($AI_ROLE);
